@@ -1,0 +1,57 @@
+; Marvell PXA986/PXA988 GPIO controller (GpioClx client)
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%PROVIDER%
+DriverVer = 11/19/2026,1.0.0.0
+CatalogFile=goyagpio.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyagpio.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[ControlFlags]
+BasicDriverOk = *
+ExcludeFromSelect = *
+
+[Manufacturer]
+%PROVIDER%=Marvell,NTARM
+
+[Marvell.NTARM]
+%GPIO.DeviceDesc% = GPIO_Inst,ACPI\MRVL0003
+
+[GPIO_Inst.NT]
+CopyFiles = GPIOCopyFiles
+
+[GPIOCopyFiles]
+goyagpio.sys,,,0x100
+
+[GPIO_Inst.NT.Services]
+AddService = goyagpio,%SPSVCINST_ASSOCSERVICE%,GPIO_Service_Inst
+
+[GPIO_Service_Inst]
+DisplayName    = %GPIO.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyagpio.sys
+LoadOrderGroup = Base
+Dependencies   = GPIOClx0101
+
+[GPIO_Inst.NT.Wdf]
+KmdfService = goyagpio, GPIO_wdfsect
+
+[GPIO_wdfsect]
+KmdfLibraryVersion = 1.11
+
+[Strings]
+PROVIDER = "Goya"
+GPIO.DeviceDesc = "Marvell PXA988 GPIO Controller"
+GPIO.SvcDesc = "Marvell PXA988 GPIO Controller Driver"
+SPSVCINST_ASSOCSERVICE = 0x00000002

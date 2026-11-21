@@ -1,0 +1,64 @@
+; Zinitix BT532 touchscreen (Galaxy Tab 3 Lite) - KMDF lower filter under mshidkmdf.sys
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%PROVIDER%
+DriverVer = 11/20/2026,1.0.0.0
+CatalogFile=goyatouch.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyatouch.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%PROVIDER%=Goya,NTARM
+
+[Goya.NTARM]
+%Touch.DeviceDesc% = Touch_Inst,ACPI\MRVL0005
+
+[Touch_Inst.NT]
+CopyFiles = Touch_Copy
+
+[Touch_Copy]
+goyatouch.sys
+
+[Touch_Inst.NT.HW]
+AddReg = Touch_AddReg
+
+[Touch_AddReg]
+HKR,,"LowerFilters",0x00010000,"goyatouch"
+
+[Touch_Inst.NT.Services]
+AddService = goyatouch,,Touch_Service_Inst
+AddService = mshidkmdf,0x000001fa,mshidkmdf_Service_Inst
+
+[Touch_Service_Inst]
+DisplayName    = %Touch.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyatouch.sys
+LoadOrderGroup = PNP Filter
+
+[mshidkmdf_Service_Inst]
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %10%\System32\Drivers\mshidkmdf.sys
+
+[Touch_Inst.NT.Wdf]
+KmdfService = goyatouch, Touch_wdfsect
+
+[Touch_wdfsect]
+KmdfLibraryVersion = 1.11
+
+[Strings]
+PROVIDER = "Goya"
+Touch.DeviceDesc = "Zinitix BT532 Touchscreen"
+Touch.SvcDesc = "Zinitix BT532 Touchscreen Filter Driver"

@@ -1,0 +1,57 @@
+; Marvell PXA986/PXA988 TWSI (I2C) controller, SpbCx client
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%PROVIDER%
+DriverVer = 11/19/2026,1.0.0.0
+CatalogFile=goyai2c.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyai2c.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[ControlFlags]
+BasicDriverOk = *
+ExcludeFromSelect = *
+
+[Manufacturer]
+%PROVIDER%=Marvell,NTARM
+
+[Marvell.NTARM]
+%I2C.DeviceDesc% = I2C_Inst,ACPI\MRVL0004
+
+[I2C_Inst.NT]
+CopyFiles = I2CCopyFiles
+
+[I2CCopyFiles]
+goyai2c.sys,,,0x100
+
+[I2C_Inst.NT.Services]
+AddService = goyai2c,%SPSVCINST_ASSOCSERVICE%,I2C_Service_Inst
+
+[I2C_Service_Inst]
+DisplayName    = %I2C.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyai2c.sys
+LoadOrderGroup = Base
+Dependencies   = SpbCx
+
+[I2C_Inst.NT.Wdf]
+KmdfService = goyai2c, I2C_wdfsect
+
+[I2C_wdfsect]
+KmdfLibraryVersion = 1.11
+
+[Strings]
+PROVIDER = "Goya"
+I2C.DeviceDesc = "Marvell PXA988 I2C Controller"
+I2C.SvcDesc = "Marvell PXA988 I2C Controller Driver"
+SPSVCINST_ASSOCSERVICE = 0x00000002

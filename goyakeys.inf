@@ -1,0 +1,64 @@
+; Galaxy Tab 3 Lite hardware keys (volume, home, power) - KMDF lower filter under mshidkmdf.sys
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%PROVIDER%
+DriverVer = 11/20/2026,1.0.0.0
+CatalogFile=goyakeys.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyakeys.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%PROVIDER%=Goya,NTARM
+
+[Goya.NTARM]
+%Keys.DeviceDesc% = Keys_Inst,ACPI\MRVL0006
+
+[Keys_Inst.NT]
+CopyFiles = Keys_Copy
+
+[Keys_Copy]
+goyakeys.sys
+
+[Keys_Inst.NT.HW]
+AddReg = Keys_AddReg
+
+[Keys_AddReg]
+HKR,,"LowerFilters",0x00010000,"goyakeys"
+
+[Keys_Inst.NT.Services]
+AddService = goyakeys,,Keys_Service_Inst
+AddService = mshidkmdf,0x000001fa,mshidkmdf_Service_Inst
+
+[Keys_Service_Inst]
+DisplayName    = %Keys.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyakeys.sys
+LoadOrderGroup = PNP Filter
+
+[mshidkmdf_Service_Inst]
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %10%\System32\Drivers\mshidkmdf.sys
+
+[Keys_Inst.NT.Wdf]
+KmdfService = goyakeys, Keys_wdfsect
+
+[Keys_wdfsect]
+KmdfLibraryVersion = 1.11
+
+[Strings]
+PROVIDER = "Goya"
+Keys.DeviceDesc = "Hardware Keys"
+Keys.SvcDesc = "Hardware Keys Filter Driver"
