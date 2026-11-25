@@ -9,7 +9,7 @@
      a red line at the top left shows: driver, site, exception code, offset of the faulting address in
      the driver image (or the raw address if it is outside), raw address.
 
-   Driver ids: 1 goyasdhc, 2 goyabatt, 3 goyagpio, 4 goyai2c, 5 goyatouch, 6 goyakeys, 7 goyabug.
+   Driver ids: 1 goyasdhc, 2 goyabatt (was goyapinmux), 3 goyagpio, 4 goyai2c, 5 goyatouch, 6 goyakeys, 7 goyabug, 8 goyasdio.
    Framebuffer: 0x17000000, 1024 x 600, 32 bpp (reserved by the firmware).
 
    Header-only (static); define GOYA_TRACE_ID before including. */
@@ -92,10 +92,15 @@ static ULONG GtHex(PULONG Fb, ULONG X, ULONG Y, ULONG Value, ULONG Digits, ULONG
 }
 
 /* "<id> <site>" at the top right, one line per driver. */
+/* Screen rows at the top right: step lines of drivers 1..7 in rows 0..6, then two value rows per driver
+   from row 7 (driver 1: rows 7-8 ... driver 8: rows 21-22). A driver id above 7 gets its step line below
+   the value rows (row 23 for goyasdio), not in row id-1, which is driver 1's first value row. */
+#define GT_STEP_ROW  (GOYA_TRACE_ID <= 7 ? GOYA_TRACE_ID - 1 : 23 + (GOYA_TRACE_ID - 8))
+
 static VOID GoyaTraceStep(ULONG Site)
 {
     PULONG fb = GtFb();
-    ULONG y = 8 + (GOYA_TRACE_ID - 1) * 6 * GT_SCALE, x = GT_FB_W - 12 * 4 * GT_SCALE;
+    ULONG y = 8 + GT_STEP_ROW * 6 * GT_SCALE, x = GT_FB_W - 12 * 4 * GT_SCALE;
     GOYALOG_HDR *lg = GtLog();
     if (lg != NULL && GOYA_TRACE_ID < GOYALOG_SLOTS) {
         lg->Slot[GOYA_TRACE_ID].Site = Site;
