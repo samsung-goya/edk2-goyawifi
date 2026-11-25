@@ -1,0 +1,50 @@
+; Zinitix BT532 touchscreen (Galaxy Tab 3 Lite) - WDM mouse port driver (absolute mouse under mouclass)
+[Version]
+Signature="$WINDOWS NT$"
+Class=Mouse
+ClassGuid={4d36e96f-e325-11ce-bfc1-08002be10318}
+Provider=%PROVIDER%
+DriverVer = 11/21/2026,1.3.0.0
+CatalogFile=goyatouch.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyatouch.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%PROVIDER%=Goya,NTARM
+
+[Goya.NTARM]
+; Bound to the I2C1 controller device (MRVL0004, TWSI1 registers), not to TCH0 (MRVL0005): TCH0 declares
+; an I2cSerialBus connection on I2C1 and Windows never started it while I2C1 had no driver, so goyatouch
+; was never loaded. goyatouch drives TWSI1 itself, so it replaces goyai2c (do not install both).
+%Touch.DeviceDesc% = Touch_Inst,ACPI\MRVL0004
+
+[Touch_Inst.NT]
+CopyFiles = Touch_Copy
+
+[Touch_Copy]
+goyatouch.sys
+
+; mouclass.sys sits on top as the Mouse class upper filter (Control\Class\{4d36e96f-...}\UpperFilters;
+; make-goya-sd.cmd makes sure it is set in the WinPE image)
+
+[Touch_Inst.NT.Services]
+AddService = goyatouch,0x00000002,Touch_Service_Inst
+
+[Touch_Service_Inst]
+DisplayName    = %Touch.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyatouch.sys
+
+[Strings]
+PROVIDER = "Goya"
+Touch.DeviceDesc = "Zinitix BT532 Touchscreen (mouse)"
+Touch.SvcDesc = "Zinitix BT532 Touchscreen"

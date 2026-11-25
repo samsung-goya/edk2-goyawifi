@@ -1,0 +1,48 @@
+; goyasdio - SDIO bus driver for the Marvell 88W8777 Wi-Fi/Bluetooth module on SDH2 (Galaxy Tab 3 Lite)
+; Enumerates SD\VID_02DF&PID_9131 (WLAN, function 1; goyawifi.inf) and SD\VID_02DF&PID_9132 (Bluetooth,
+; function 2; no driver yet) and gives them the Windows SD bus interface (GUID_SDBUS_INTERFACE_STANDARD).
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%PROVIDER%
+DriverVer = 11/25/2026,1.0.0.0
+CatalogFile=goyasdio.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyasdio.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%PROVIDER%=Goya,NTARM
+
+[Goya.NTARM]
+; Device (SDH2) in the firmware DSDT, registers 0xD4280800. No _CID PNP0D40: the inbox sdbus.sys must
+; not take this controller.
+%Sdio.DeviceDesc% = Sdio_Inst,ACPI\MRVL0009
+
+[Sdio_Inst.NT]
+CopyFiles = Sdio_Copy
+
+[Sdio_Copy]
+goyasdio.sys
+
+[Sdio_Inst.NT.Services]
+AddService = goyasdio,0x00000002,Sdio_Service_Inst
+
+[Sdio_Service_Inst]
+DisplayName    = %Sdio.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyasdio.sys
+
+[Strings]
+PROVIDER = "Goya"
+Sdio.DeviceDesc = "PXA988 SDIO bus (SDH2, Marvell 88W8777)"
+Sdio.SvcDesc = "Goya SDIO bus"

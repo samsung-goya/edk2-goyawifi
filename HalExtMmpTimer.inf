@@ -1,0 +1,54 @@
+; Copyright (c) Microsoft Corporation. All rights reserved.
+; Licensed under the MIT License.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Computer
+ClassGuid={4d36e966-e325-11ce-bfc1-08002be10318}
+Provider=%MSFT%
+DriverVer = 11/19/2026,1.0.0.0
+PnPLockdown=1
+CatalogFile=HalExtMmpTimer.cat
+
+[ControlFlags]
+ExcludeFromSelect=*
+
+[DestinationDirs]
+DefaultDestDir = 11 ; System32 (DIRID 13, the driver store, exists only on Windows 10 1709+)
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+HalExtMmpTimer.dll    = 3426
+
+[Manufacturer]
+%MFGNAME% = DeviceList, NTARM
+
+[DeviceList.NTARM]
+%MMP_TIMERS% = MMP_TIMERS, ACPI\MRVL0002
+
+[MMP_TIMERS]
+AddReg = MMP_TIMERS_AddReg
+CopyFiles = MMP_TIMERS_CopyFiles
+
+[MMP_TIMERS_AddReg]
+HKLM,"%OSEDB%\VEN_MRVL&DEV_0001","HALExtension",,"HalExtMmpTimer.dll"
+
+[MMP_TIMERS_CopyFiles]
+HalExtMmpTimer.dll,,,0x00001000
+
+[MMP_TIMERS.Services]
+AddService = , %SPSVCINST_ASSOCSERVICE%
+
+[Strings]
+
+;Non-localizable
+SPSVCINST_ASSOCSERVICE = 0x00000002
+OSEDB = "SYSTEM\CurrentControlSet\Control\OSExtensionDatabase"
+
+;Localizable
+MSFT            = "MSFT"
+MFGNAME         = "Microsoft"
+MMP_TIMERS  = "Marvell PXA988 MMP Timers"
+

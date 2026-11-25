@@ -1,0 +1,59 @@
+; Galaxy Tab 3 Lite microSD boot driver (Storport miniport, PXA986/988 SDH1). BOOT START.
+; Inject into the offline Windows RT image before first boot:
+;   dism /image:X:\ /add-driver /driver:goyasdhc.inf /forceunsigned
+[Version]
+Signature="$WINDOWS NT$"
+Class=SCSIAdapter
+ClassGuid={4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider=%PROVIDER%
+DriverVer = 11/20/2026,2.0.0.0
+CatalogFile=goyasdhc.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyasdhc.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[ControlFlags]
+BasicDriverOk = *
+ExcludeFromSelect = *
+
+[Manufacturer]
+%PROVIDER%=Goya,NTARM
+
+[Goya.NTARM]
+%SD.DeviceDesc% = SD_Inst,ACPI\MRVL0007
+
+[SD_Inst.NT]
+CopyFiles = SD_Copy
+
+[SD_Copy]
+goyasdhc.sys,,,0x100
+
+[SD_Inst.NT.Services]
+AddService = goyasdhc,0x00000002,SD_Service_Inst
+
+[SD_Service_Inst]
+DisplayName    = %SD.SvcDesc%
+ServiceType    = 1
+StartType      = 0
+ErrorControl   = 3
+ServiceBinary  = %12%\goyasdhc.sys
+LoadOrderGroup = SCSI miniport
+AddReg         = SD_Service_Reg
+
+[SD_Service_Reg]
+HKR,,BootFlags,0x00010003,0x00000008
+HKR,"Parameters\PnpInterface","0",0x00010001,0x00000001
+HKR,"Parameters\PnpInterface","1",0x00010001,0x00000001
+HKR,"Parameters\PnpInterface","15",0x00010001,0x00000001
+HKR,"Parameters\PnpInterface","17",0x00010001,0x00000001
+
+[Strings]
+PROVIDER = "Goya"
+SD.DeviceDesc = "Galaxy Tab 3 Lite microSD (PXA986 SDH1)"
+SD.SvcDesc = "Goya microSD boot driver"

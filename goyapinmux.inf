@@ -1,0 +1,56 @@
+; Marvell PXA986/PXA988 pin multiplexer (MFPR) driver
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%PROVIDER%
+DriverVer = 11/20/2026,1.0.0.0
+CatalogFile=goyapinmux.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyapinmux.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[ControlFlags]
+BasicDriverOk = *
+ExcludeFromSelect = *
+
+[Manufacturer]
+%PROVIDER%=Marvell,NTARM
+
+[Marvell.NTARM]
+%PMX.DeviceDesc% = PMX_Inst,ACPI\MRVL0008
+
+[PMX_Inst.NT]
+CopyFiles = PMXCopyFiles
+
+[PMXCopyFiles]
+goyapinmux.sys,,,0x100
+
+[PMX_Inst.NT.Services]
+AddService = goyapinmux,%SPSVCINST_ASSOCSERVICE%,PMX_Service_Inst
+
+[PMX_Service_Inst]
+DisplayName    = %PMX.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyapinmux.sys
+LoadOrderGroup = Base
+
+[PMX_Inst.NT.Wdf]
+KmdfService = goyapinmux, PMX_wdfsect
+
+[PMX_wdfsect]
+KmdfLibraryVersion = 1.11
+
+[Strings]
+PROVIDER = "Goya"
+PMX.DeviceDesc = "Marvell PXA988 Pin Multiplexer"
+PMX.SvcDesc = "Marvell PXA988 Pin Multiplexer Driver"
+SPSVCINST_ASSOCSERVICE = 0x00000002
