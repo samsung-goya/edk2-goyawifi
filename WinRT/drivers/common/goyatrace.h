@@ -9,7 +9,7 @@
      a red line at the top left shows: driver, site, exception code, offset of the faulting address in
      the driver image (or the raw address if it is outside), raw address.
 
-   Driver ids: 1 goyasdhc, 2 goyapinmux, 3 goyagpio, 4 goyai2c, 5 goyatouch, 6 goyakeys.
+   Driver ids: 1 goyasdhc, 2 goyabatt, 3 goyagpio, 4 goyai2c, 5 goyatouch, 6 goyakeys, 7 goyabug.
    Framebuffer: 0x17000000, 1024 x 600, 32 bpp (reserved by the firmware).
 
    Header-only (static); define GOYA_TRACE_ID before including. */

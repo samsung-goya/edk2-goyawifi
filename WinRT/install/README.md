@@ -11,5 +11,5 @@ Boot it with the EDK2 image `goyawifi-uefi-winrt-release.img` (RTC fixed to 2012
 still valid). Use `WinRT\winpe\make-goya-sd.cmd` first if you want to test the drivers in WinPE (runs from RAM).
 
 Known limits: first boot is slow (polled PIO SD driver); only CPU0 is used; Windows RT code integrity may still refuse
-unsigned drivers depending on the build; no display, battery, Wi-Fi or audio drivers yet (the screen is the UEFI
+unsigned drivers depending on the build; no display, Wi-Fi or audio drivers yet (the screen is the UEFI
 framebuffer through BasicDisplay).

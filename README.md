@@ -197,6 +197,17 @@ branch). WinPE cards: `WinRT/winpe/make-goya-sd.cmd`; full install:
   BT532 at 0x20 like the vendor driver; it clears the chip interrupt whenever
   INT (GPIO94, pull-up on) is low.
 * **goyakeys** (KMDF lower filter under mshidkmdf): Vol Up, Vol Down and Home.
+* **goyabatt** (KMDF battery miniclass under battc, ACPI `MRVL000A` = DSDT
+  `BAT0`, needs this firmware): battery percentage, "plugged in / charging" and
+  charging itself. The SMB328 is programmed like GoyaWifiChargerDxe and polled
+  every 2 s so its watchdog never stops charging; charging stops outside
+  0..45 C, above 4.4 V or after 6 h. No coulomb counter on this tablet: the
+  percentage comes from the battery voltage (88PM822 GPADC), corrected for the
+  charge/load current, filtered and rate-limited, so it is approximate in the
+  flat middle of the curve. `tools/battsim` tests it against simulated
+  hardware. Works on the tablet (battery level, charging status follows the
+  cable). On an installed card add it with WinPE `adddrv.flag` (BRINGUP-LOG
+  section 14).
 * **goyasdhc** (Storport microSD miniport, polled PIO): the microSD card works
   in WinPE as a disk with a drive letter. On WinPE cards by default
   (`GOYA_SDHC=0` leaves it out). Build 8520's Storport needed:
@@ -272,7 +283,6 @@ branch). WinPE cards: `WinRT/winpe/make-goya-sd.cmd`; full install:
 **Not available**
 
 * Second core in Windows (CPU1 disabled in the MADT).
-* Charging and battery in Windows (no SMB328 / fuel-gauge driver).
 * Bluetooth, audio, sensors, camera, USB, GPU acceleration (no drivers).
 
 ## Second core and USB: what to look for

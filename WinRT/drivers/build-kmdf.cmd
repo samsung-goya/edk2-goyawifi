@@ -45,6 +45,8 @@ set EXTRA=
 if exist %KITS%\Lib\10.0.19041.0\km\arm\msgpioclxstub.lib set EXTRA=%KITS%\Lib\10.0.19041.0\km\arm\msgpioclxstub.lib
 if exist %KITS%\Lib\10.0.19041.0\km\arm\gpio\1.0\gpioclxstubs.lib set EXTRA=%KITS%\Lib\10.0.19041.0\km\arm\gpio\1.0\gpioclxstubs.lib
 if exist %KITS%\Lib\10.0.19041.0\km\arm\spb\1.0\spbcxstubs.lib set EXTRA=%EXTRA% %KITS%\Lib\10.0.19041.0\km\arm\spb\1.0\spbcxstubs.lib
+rem the battery miniclass driver links against the inbox battery class driver
+if /i "%N%"=="goyabatt" set EXTRA=%EXTRA% %KITS%\Lib\10.0.19041.0\km\arm\battc.lib
 echo extra libs: %EXTRA%
 link /nologo /DRIVER /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:FxDriverEntry /INTEGRITYCHECK /LIBPATH:%KMLIB% /LIBPATH:%KITS%\Lib\10.0.19041.0\km\arm ^
      /OUT:%N%.sys %N%.obj goyamem.obj WdfDriverEntry.lib WdfLdr.lib ntoskrnl.lib hal.lib wmilib.lib BufferOverflowFastFailK.lib libcntpr.lib %EXTRA% || exit /b 1

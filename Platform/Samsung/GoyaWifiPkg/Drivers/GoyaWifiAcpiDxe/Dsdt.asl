@@ -80,6 +80,14 @@ DefinitionBlock ("Dsdt.aml", "DSDT", 5, "SAMSNG", "GOYAWIFI", 0x00000001)
       Name (_UID, 0)
       Method (_STA) { Return (0xF) }
     }
+    // Battery and charger (goyabatt, a battery miniclass driver): 88PM822 GPADC on TWSI2 (gauge and
+    // thermistor), SMB328 charger and RT8973A MUIC on bit-banged GPIO buses. No resources on purpose: the
+    // driver maps the blocks itself (TWSI2 stays hidden as I2C2, GPIO belongs to GPI0).
+    Device (BAT0) {
+      Name (_HID, "MRVL000A")
+      Name (_UID, 0)
+      Method (_STA) { Return (0xF) }
+    }
     // microSD host (SDH1) = Windows boot disk. HID MRVL0007 binds goyasdhc (Storport miniport, boot
     // start, polled PIO). No _CID PNP0D40 on purpose: the inbox sdbus.sys must never take this
     // controller (it cannot handle the PXAv3 quirks). The driver polls; the interrupt below is only there

@@ -1,0 +1,53 @@
+; Galaxy Tab 3 Lite battery and charger (88PM822 gauge, SMB328 charger, RT8973A cable detection) -
+; KMDF battery miniclass driver under the inbox battery class driver battc.sys
+[Version]
+Signature="$WINDOWS NT$"
+Class=Battery
+ClassGuid={72631e54-78a4-11d0-bcf7-00aa00b7b32a}
+Provider=%PROVIDER%
+DriverVer = 11/25/2026,1.0.0.0
+CatalogFile=goyabatt.cat
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+goyabatt.sys = 3426
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%PROVIDER%=Goya,NTARM
+
+[Goya.NTARM]
+%Batt.DeviceDesc% = Batt_Inst,ACPI\MRVL000A
+
+[Batt_Inst.NT]
+Include = battery.inf
+Needs = Battery_Inst
+CopyFiles = Batt_Copy
+
+[Batt_Copy]
+goyabatt.sys
+
+[Batt_Inst.NT.Services]
+AddService = goyabatt,0x00000002,Batt_Service_Inst
+
+[Batt_Service_Inst]
+DisplayName    = %Batt.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\goyabatt.sys
+
+[Batt_Inst.NT.Wdf]
+KmdfService = goyabatt, Batt_wdfsect
+
+[Batt_wdfsect]
+KmdfLibraryVersion = 1.11
+
+[Strings]
+PROVIDER = "Goya"
+Batt.DeviceDesc = "Galaxy Tab 3 Lite Battery"
+Batt.SvcDesc = "Galaxy Tab 3 Lite Battery and Charger"

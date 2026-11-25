@@ -254,6 +254,46 @@ either), and the 1 ms polling instead of an interrupt.
 
 ---
 
+## 14. Battery and charging (goyabatt)
+
+* **goyabatt**: a KMDF battery miniclass driver under battc.sys for the DSDT
+  device `BAT0` (`ACPI\MRVL000A`, no resources: the driver maps GPIO, MFPR,
+  TWSI2 and its APBC clock itself, so I2C2 stays hidden). Every 2 s it:
+  * reads the battery voltage from the 88PM822 GPADC (VBAT on page 0x32) and
+    the thermistor (GPADC2 with bias-current stepping);
+  * talks to the SMB328 charger (0x34, bit-banged on GPIO16/17, CHG_EN GPIO98).
+    This keeps its watchdog fed, so the tablet charges under Windows;
+  * reads the cable type from the RT8973A MUIC (0x14, GPIO49/50).
+* Charging stops when the battery is too hot (45 °C) or too cold (0 °C), after
+  a 6-hour session, on a charger fault, or above 4.4 V.
+* There is no coulomb counter. The percentage comes from an OCV table, with
+  voltage corrections for charge current. It is filtered and rate-limited, never
+  rises on battery, never falls while charging, and stops at 99 % until the
+  charger reports full.
+* `tools/battsim` runs the shared core (`battcore.c`) against pin-level models
+  of the SMB328 and MUIC and a register model of the PMIC/GPADC. It covers
+  plug/unplug, watchdog, temperature, full, empty, a missing MUIC, a stuck SDA
+  line and PMIC loss, and runs on CI.
+* **Installing it into an installed card**: WinPE's DISM can't service the
+  offline image. `dismhost.exe` fails with 0x80004002 before the driver is even
+  looked at. `adddrv.flag` therefore tries DISM first, then falls back to
+  `:regdrv` using `NAME.regdrv` (HWID, class, class GUID, KMDF version from the
+  INF). The fallback:
+  * copies the .sys and backs up the SYSTEM hive to the card;
+  * creates the service key;
+  * points every existing device instance of the HWID at the service, with the
+    class and `ConfigFlags` 0, which clears the "failed install" flag 0x40.
+  This WinPE has `find.exe` but no `findstr.exe`.
+* Result: Windows RT shows the battery with its charge level, and the charging
+  status follows plugging and unplugging the cable (tested with the HID
+  MRVL0009, before SDH2 took it; renamed to MRVL000A when rebasing onto the
+  Wi-Fi work). A card that got goyabatt that way keeps a stale
+  `ACPI\MRVL0009\0` entry (SDH2 is `\2`, so goyabatt never attaches to it);
+  with the MRVL000A firmware the battery is a new device and needs
+  `adddrv.flag` once more.
+
+---
+
 ## Next
 
 * **goyasdhc**: CMD23 writes, 41.6 MHz and SDMA done (sections 11, 12).
@@ -263,10 +303,13 @@ either), and the 1 ms polling instead of an interrupt.
   layer (power, reset, identification, MMUv1, front-end ring, submission), checked against the
   Linux etnaviv sequences by `tools/gpusim/ringtest.c`. Next: the WDDM 1.2 KMD; see
   `WinRT/drivers/goyagpu/README.md` for verified facts and open questions.
-* **Charger driver**: under Windows the tablet does not charge (the SMB328
-  watchdog stops charging after the firmware hands over).
+* **goyabatt** (section 14): check the percentage against a full
+  charge/discharge cycle and tune the OCV table; confirm a full charge reaches
+  100 %.
+* **Touch died during a Windows session** (cause unknown; the next WinPE boot
+  overwrote the goyabug log).
 * Power key and screen brightness; the second CPU core (firmware support for
-  Windows' core start-up); battery percentage; Bluetooth (SDIO function 2 is enumerated).
+  Windows' core start-up); Bluetooth (SDIO function 2 is enumerated).
 * Turn off hibernation / Fast Startup on the Windows RT card (goyasdhc's
   hibernate path is untested).
 * Still to confirm: goyabug's test stop, the on-screen keyboard (goyaosk) with

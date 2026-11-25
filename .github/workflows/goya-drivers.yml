@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        driver: [goyagpio, goyai2c, goyatouch, goyakeys, goyapinmux, goyasdhc, goyabug, goyagpu, goyasdio]
+        driver: [goyagpio, goyai2c, goyatouch, goyakeys, goyapinmux, goyasdhc, goyabug, goyagpu, goyasdio, goyabatt]
         dir: [WinRT/drivers]
         include:
           - driver: HalExtMmpTimer
@@ -63,6 +63,15 @@ jobs:
             ${{ matrix.dir }}/${{ matrix.driver }}/${{ matrix.driver }}.dll
             ${{ matrix.dir }}/${{ matrix.driver }}/${{ matrix.driver }}.inf
           if-no-files-found: error
+
+  simulators:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: goyasdhc core against the simulated SD host
+        run: cc -O1 -Wall -o sdsim tools/sdsim/sim.c && timeout 300 ./sdsim | tail -5
+      - name: goyabatt core against the simulated charger, MUIC and PMIC
+        run: cc -O1 -Wall -o battsim tools/battsim/sim.c -lm && timeout 300 ./battsim
 
   goyaosk:
     runs-on: ubuntu-24.04

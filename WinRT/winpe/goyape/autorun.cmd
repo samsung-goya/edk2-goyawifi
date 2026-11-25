@@ -71,6 +71,18 @@ set DRV=%WIN%\Windows\System32\drivers
 for %%f in ("%~dp0install\*.sys") do call :instdrv %%~nf
 :noinstall
 
+rem ---- adddrv.flag: add every driver package in .\adddrv\ (NAME.inf + .sys + .cat) to the Windows RT
+rem install's driver store with DISM, for a device that has no driver yet (install.flag only replaces
+rem the files of drivers that are installed already). Windows installs it when it finds the device. ----
+if not exist "%~dp0adddrv.flag" goto noadddrv
+move /y "%~dp0adddrv.flag" "%~dp0adddrv.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SYSTEM if /i not "%%d:"=="%~d0" set WIN=%%d:
+echo --- add driver packages from .\adddrv to %WIN% >> "%OUT%"
+if not defined WIN (echo no Windows partition found >> "%OUT%" & goto noadddrv)
+for %%f in ("%~dp0adddrv\*.inf") do call :adddrv "%%f"
+:noadddrv
+
 rem ---- setuplogs.flag: copy Windows Setup's logs from the Windows RT partition to .\setuplogs\ ----
 if not exist "%~dp0setuplogs.flag" goto nosetuplogs
 move /y "%~dp0setuplogs.flag" "%~dp0setuplogs.done" >nul
@@ -248,6 +260,72 @@ del "%~dp0twrp.flag"
 if not exist "%~d0\goya" mkdir "%~d0\goya"
 echo WinPE autorun > "%~d0\goya\reboot-recovery"
 wpeutil reboot
+goto :eof
+
+rem ---- :adddrv INF - DISM /Add-Driver into the offline Windows RT install (see adddrv.flag). This
+rem WinPE's DISM cannot start its servicing host for the image (dismhost: 0x80004002), so when DISM
+rem fails and NAME.regdrv is next to the INF, :regdrv registers the driver directly. ----
+:adddrv
+echo -- %~nx1 >> "%OUT%"
+dism /English /Image:%WIN%\ /Add-Driver /Driver:%1 /ForceUnsigned /LogPath:"%~dp0adddrv-dism.log" >> "%OUT%" 2>&1
+set RC=%ERRORLEVEL%
+echo %~nx1 dism exit code %RC% >> "%OUT%"
+if "%RC%"=="0" goto :eof
+if exist "%~dpn1.regdrv" (call :regdrv "%~dpn1") else (echo no %~n1.regdrv, nothing else to try >> "%OUT%")
+goto :eof
+
+rem ---- :regdrv PATH (without extension) - what the INF would do, written straight into the offline
+rem install: PATH.sys into System32\drivers, the service key (+ KMDF version), and every existing
+rem device instance of the hardware ID pointed at the service with its class and ConfigFlags 0, so the
+rem next boot starts the driver without a driver-store install. PATH.regdrv holds HWID=, CLASS=,
+rem GUID= (class GUID) and KMDF= lines. The SYSTEM hive is copied to .\adddrv first. ----
+:regdrv
+set RN=%~n1
+set R_HWID=& set R_CLASS=& set R_GUID=& set R_KMDF=
+for /f "usebackq eol=; tokens=1,* delims==" %%a in ("%~1.regdrv") do set R_%%a=%%b
+echo registry install of %RN% for %R_HWID% (class %R_CLASS% %R_GUID%, KMDF %R_KMDF%) >> "%OUT%"
+if not defined R_HWID (echo %RN%.regdrv has no HWID line >> "%OUT%" & goto :eof)
+copy /b /y "%~1.sys" %WIN%\Windows\System32\drivers\%RN%.sys >> "%OUT%" 2>&1
+"%~dp0goyacmp.exe" "%~1.sys" %WIN%\Windows\System32\drivers\%RN%.sys >> "%OUT%" 2>&1
+echo System32\drivers\%RN%.sys compare exit code %ERRORLEVEL% >> "%OUT%"
+if exist %WIN%\goya\drivers for %%e in (sys inf cat) do copy /b /y "%~1.%%e" %WIN%\goya\drivers\ >> "%OUT%" 2>&1
+copy /b /y %WIN%\Windows\System32\config\SYSTEM "%~dp0adddrv\SYSTEM.before-%RN%" >> "%OUT%" 2>&1
+if errorlevel 1 (echo hive backup failed, registry not changed >> "%OUT%" & goto :eof)
+reg load HKLM\GOYAREG %WIN%\Windows\System32\config\SYSTEM >> "%OUT%" 2>&1
+if errorlevel 1 (echo hive load failed >> "%OUT%" & goto :eof)
+rem (this WinPE has find.exe but no findstr.exe)
+set CS=1
+for /f "tokens=3" %%v in ('reg query HKLM\GOYAREG\Select /v Current ^| find "Current"') do set /a CS=%%v
+set CS=000%CS%
+set RK=HKLM\GOYAREG\ControlSet%CS:~-3%
+echo control set %RK% >> "%OUT%"
+reg add %RK%\Services\%RN% /v Type /t REG_DWORD /d 1 /f >> "%OUT%" 2>&1
+reg add %RK%\Services\%RN% /v Start /t REG_DWORD /d 3 /f >> "%OUT%" 2>&1
+reg add %RK%\Services\%RN% /v ErrorControl /t REG_DWORD /d 1 /f >> "%OUT%" 2>&1
+reg add %RK%\Services\%RN% /v ImagePath /t REG_EXPAND_SZ /d \SystemRoot\System32\drivers\%RN%.sys /f >> "%OUT%" 2>&1
+reg add %RK%\Services\%RN% /v DisplayName /t REG_SZ /d %RN% /f >> "%OUT%" 2>&1
+if defined R_KMDF reg add %RK%\Services\%RN%\Parameters\Wdf /v KmdfLibraryVersion /t REG_SZ /d %R_KMDF% /f >> "%OUT%" 2>&1
+reg query "%RK%\Enum\%R_HWID%" >nul 2>&1
+if errorlevel 1 (echo no %R_HWID% device in the registry yet ^(Windows has not seen it^) >> "%OUT%" & goto regdone)
+set RDEV=0
+for /f "delims=" %%i in ('reg query "%RK%\Enum\%R_HWID%" ^| find "HKEY_"') do call :regdev "%%i"
+echo %RDEV% device instance(s) pointed at %RN% >> "%OUT%"
+:regdone
+reg query %RK%\Services\%RN% /s >> "%OUT%" 2>&1
+reg unload HKLM\GOYAREG >> "%OUT%" 2>&1
+goto :eof
+
+rem ---- :regdev KEY - one device instance key (subkeys without a HardwareID value are skipped) ----
+:regdev
+echo device %~1 >> "%OUT%"
+reg query "%~1" /v HardwareID >nul 2>&1
+if errorlevel 1 (echo   no HardwareID, skipped >> "%OUT%" & goto :eof)
+reg add "%~1" /v Service /t REG_SZ /d %RN% /f >> "%OUT%" 2>&1
+if defined R_CLASS reg add "%~1" /v Class /t REG_SZ /d %R_CLASS% /f >> "%OUT%" 2>&1
+if defined R_GUID reg add "%~1" /v ClassGUID /t REG_SZ /d %R_GUID% /f >> "%OUT%" 2>&1
+reg add "%~1" /v ConfigFlags /t REG_DWORD /d 0 /f >> "%OUT%" 2>&1
+set /a RDEV+=1
+reg query "%~1" >> "%OUT%" 2>&1
 goto :eof
 
 rem ---- :instdrv NAME - install .\install\NAME.sys (see install.flag) ----

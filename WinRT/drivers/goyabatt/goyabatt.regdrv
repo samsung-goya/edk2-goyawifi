@@ -1,0 +1,5 @@
+; WinPE autorun :regdrv (adddrv.flag fallback when DISM cannot service the image): what goyabatt.inf sets up
+HWID=ACPI\MRVL000A
+CLASS=Battery
+GUID={72631e54-78a4-11d0-bcf7-00aa00b7b32a}
+KMDF=1.11
