@@ -2,6 +2,7 @@
 typedef long NTSTATUS; typedef unsigned long ULONG, *PULONG; typedef unsigned char UCHAR,*PUCHAR, BOOLEAN;
 typedef unsigned int UINT32; typedef unsigned long long ULONGLONG; typedef long long LONGLONG; typedef void *PVOID; typedef unsigned short USHORT;
 typedef void VOID;
+typedef long LONG; long InterlockedCompareExchange(volatile long *Destination, long Exchange, long Comparand);
 #define TRUE 1
 #define FALSE 0
 #define NULL ((void*)0)

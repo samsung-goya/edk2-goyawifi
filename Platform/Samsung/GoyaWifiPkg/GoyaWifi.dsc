@@ -195,6 +195,11 @@
   # Memory: 1 GiB LPDDR2 at 0. S-Boot loads us at 0x10008000.
   gArmTokenSpaceGuid.PcdSystemMemoryBase|0x00000000
   gArmTokenSpaceGuid.PcdSystemMemorySize|0x40000000
+
+  # SMBIOS 2.7 with the 32-bit entry point only (Windows 8 does not read the 3.0 one)
+  gEfiMdeModulePkgTokenSpaceGuid.PcdSmbiosVersion|0x0207
+  gEfiMdeModulePkgTokenSpaceGuid.PcdSmbiosDocRev|0x0
+  gEfiMdeModulePkgTokenSpaceGuid.PcdSmbiosEntryPointProvideMethod|0x1
   gArmPlatformTokenSpaceGuid.PcdSystemMemoryUefiRegionSize|0x04000000
   gArmPlatformTokenSpaceGuid.PcdCPUCorePrimaryStackSize|0x10000
   gEmbeddedTokenSpaceGuid.PcdPrePiCpuIoSize|0
@@ -287,6 +292,8 @@
   MdeModulePkg/Universal/Acpi/AcpiTableDxe/AcpiTableDxe.inf
   Platform/Samsung/GoyaWifiPkg/Drivers/GoyaWifiAcpiDxe/GoyaWifiAcpiDxe.inf
   Platform/Samsung/GoyaWifiPkg/Drivers/WinKernelFixupDxe/WinKernelFixupDxe.inf
+  MdeModulePkg/Universal/SmbiosDxe/SmbiosDxe.inf
+  Platform/Samsung/GoyaWifiPkg/Drivers/GoyaWifiSmbiosDxe/GoyaWifiSmbiosDxe.inf
   MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
   MdeModulePkg/Universal/HiiDatabaseDxe/HiiDatabaseDxe.inf
 

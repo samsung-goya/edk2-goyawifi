@@ -11,6 +11,7 @@
 #include <Uefi.h>
 #include <IndustryStandard/Acpi.h>
 #include <Protocol/AcpiTable.h>
+#include <Protocol/Pxa988Cpu1Parking.h>
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
@@ -22,6 +23,8 @@
 #define OEM_ID         { 'S','A','M','S','N','G' }
 #define OEM_TABLE_ID   SIGNATURE_64 ('G','O','Y','A','W','I','F','I')
 #define CREATOR_ID     SIGNATURE_32 ('E','D','K','2')
+#define DSDT_AML_NAME_OP      0x08     // NameOp
+#define DSDT_AML_BYTE_PREFIX  0x0A     // BytePrefix
 
 #define GIC_DIST_BASE  0xD1DFF000ULL   // verified on hardware (not 0xD1DF1000)
 #define GIC_CPU_BASE   0xD1DFE100ULL   // verified on hardware (not 0xD1DF0100)
@@ -147,7 +150,7 @@ STATIC SPCR_TABLE   mSpcr;
 STATIC
 VOID
 BuildTables (
-  VOID
+  IN CONST PXA988_CPU1_PARKING_PROTOCOL  *Parking
   )
 {
   UINTN  I;
@@ -175,10 +178,15 @@ BuildTables (
     mMadt.Gicc[I].Length                  = sizeof (EFI_ACPI_5_0_GIC_STRUCTURE);
     mMadt.Gicc[I].GicId                   = (UINT32)I;
     mMadt.Gicc[I].AcpiProcessorUid        = (UINT32)I;
-    mMadt.Gicc[I].Flags                   = (I == 0) ? EFI_ACPI_5_0_GIC_ENABLED : 0;   // CPU1 disabled for now
-    mMadt.Gicc[I].ParkingProtocolVersion  = 0;
+    //
+    // CPU1 is enabled only when Pxa988SmpDxe left it waiting in its ACPI
+    // parking-protocol page ("Multi-processor Startup for ARM Platforms"):
+    // the OS writes the entry point there and wakes it with an SGI.
+    //
+    mMadt.Gicc[I].Flags                   = ((I == 0) || (Parking->ParkedAddress[1] != 0)) ? EFI_ACPI_5_0_GIC_ENABLED : 0;
+    mMadt.Gicc[I].ParkingProtocolVersion  = (Parking->ParkedAddress[I] != 0) ? PXA988_PARKING_PROTOCOL_VERSION : 0;
     mMadt.Gicc[I].PerformanceInterruptGsiv = 0;
-    mMadt.Gicc[I].ParkedAddress           = 0;
+    mMadt.Gicc[I].ParkedAddress           = Parking->ParkedAddress[I];
     mMadt.Gicc[I].PhysicalBaseAddress     = GIC_CPU_BASE;
   }
 
@@ -259,22 +267,49 @@ GoyaWifiAcpiEntry (
   IN EFI_SYSTEM_TABLE  *SystemTable
   )
 {
-  EFI_ACPI_TABLE_PROTOCOL  *Acpi;
-  EFI_STATUS               Status;
-  UINT8                    *Dsdt;
+  EFI_ACPI_TABLE_PROTOCOL       *Acpi;
+  EFI_STATUS                    Status;
+  UINT8                         *Dsdt;
+  PXA988_CPU1_PARKING_PROTOCOL  *Parking;
+  PXA988_CPU1_PARKING_PROTOCOL  NoParking;
+  UINTN                         I;
+  UINTN                         Found;
 
   Status = gBS->LocateProtocol (&gEfiAcpiTableProtocolGuid, NULL, (VOID **)&Acpi);
   if (EFI_ERROR (Status)) {
     return Status;
   }
 
-  BuildTables ();
+  Status = gBS->LocateProtocol (&gPxa988Cpu1ParkingProtocolGuid, NULL, (VOID **)&Parking);
+  if (EFI_ERROR (Status)) {
+    ZeroMem (&NoParking, sizeof (NoParking));
+    Parking = &NoParking;
+  }
+
+  DEBUG ((DEBUG_INFO, "GoyaWifiAcpi: parking pages CPU0 0x%lx CPU1 0x%lx\n", Parking->ParkedAddress[0], Parking->ParkedAddress[1]));
+  BuildTables (Parking);
 
   Dsdt = AllocateCopyPool (mDsdtAmlLen, mDsdtAml);
   if (Dsdt == NULL) {
     return EFI_OUT_OF_RESOURCES;
   }
 
+  //
+  // CPU1's _STA returns \_SB.CPU1.STAV (Name STAV ByteConst 0x0F): make it 0
+  // when the MADT has CPU1 disabled, so the DSDT agrees with the MADT
+  //
+  Found = 0;
+  for (I = 0; I + 7 <= mDsdtAmlLen; I++) {
+    if ((Dsdt[I] == DSDT_AML_NAME_OP) && (CompareMem (&Dsdt[I + 1], "STAV", 4) == 0) && (Dsdt[I + 5] == DSDT_AML_BYTE_PREFIX)) {
+      if (Parking->ParkedAddress[1] == 0) {
+        Dsdt[I + 6] = 0;
+      }
+
+      Found++;
+    }
+  }
+
+  ASSERT (Found == 1);
   ((EFI_ACPI_DESCRIPTION_HEADER *)Dsdt)->OemTableId = OEM_TABLE_ID;
   Checksum ((EFI_ACPI_DESCRIPTION_HEADER *)Dsdt);
 

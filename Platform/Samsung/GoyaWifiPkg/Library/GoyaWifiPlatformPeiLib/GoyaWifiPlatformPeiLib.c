@@ -19,6 +19,7 @@ STATIC CONST RESERVED_REGION  mReserved[] = {
   { 0x00000000, 0x00100000, "OBM / BootROM scratch"          },
   { 0x06000000, 0x02100000, "CP carveout (HW protected)"     },
   { 0x08100000, 0x00080000, "ramoops / last_kmsg"            },
+  { 0x08180000, 0x00002000, "ACPI parking pages CPU0/CPU1"   },   // PXA988_PARKING_PAGES
 };
 
 EFI_STATUS

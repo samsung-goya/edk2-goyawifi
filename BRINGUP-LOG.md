@@ -285,9 +285,12 @@ either), and the 1 ms polling instead of an interrupt.
     class and `ConfigFlags` 0, which clears the "failed install" flag 0x40.
   This WinPE has `find.exe` but no `findstr.exe`.
 * Result: Windows RT shows the battery with its charge level, and the charging
-  status follows plugging and unplugging the cable (tested with the HID
-  MRVL0009, before SDH2 took it; renamed to MRVL000A when rebasing onto the
-  Wi-Fi work). A card that got goyabatt that way keeps a stale
+  status follows plugging and unplugging the cable. First tested with the
+  HID MRVL0009, before SDH2 took it; renamed to MRVL000A when rebasing onto
+  the Wi-Fi work, and tested again with that firmware. A new HID takes two
+  boots: Windows must enumerate the device once (unknown device) before
+  `:regdrv` finds an instance to point at the service, so boot Windows once,
+  then run `adddrv.flag`. A card that got goyabatt as MRVL0009 keeps a stale
   `ACPI\MRVL0009\0` entry (SDH2 is `\2`, so goyabatt never attaches to it);
   with the MRVL000A firmware the battery is a new device and needs
   `adddrv.flag` once more.

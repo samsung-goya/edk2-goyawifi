@@ -7,12 +7,14 @@ DefinitionBlock ("Dsdt.aml", "DSDT", 5, "SAMSNG", "GOYAWIFI", 0x00000001)
       Name (_HID, "ACPI0007")
       Name (_UID, 0)
     }
-    // CPU1's GICC entry is disabled in the MADT (no SMP bring-up yet): report it not present so the
-    // processor object matches the MADT.
+    // CPU1 waits for the OS in its ACPI parking-protocol page (MADT GICC enabled). GoyaWifiAcpiDxe
+    // patches STAV to 0 when the firmware could not park it (MADT GICC disabled), so the processor
+    // object always matches the MADT.
     Device (CPU1) {
       Name (_HID, "ACPI0007")
       Name (_UID, 1)
-      Method (_STA) { Return (0x0) }
+      Name (STAV, 0x0F)
+      Method (_STA) { Return (STAV) }
     }
     // Marvell MMP timer 0 HAL extension is matched by CSRT; this device lets the
     // INF install it (ACPI\MRVL0002)

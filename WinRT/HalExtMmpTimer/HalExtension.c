@@ -65,6 +65,11 @@ static FORCEINLINE VOID WriteReg(PVOID Base, ULONG Reg, ULONG Value)
 //   7 flips magenta/green on every timer interrupt
 //   8-15 interrupt count / 8 in binary (white = 1), most significant bit first
 //   16 QueryCounter used (blue), flips to purple every 4096 calls
+//   17 processor that took the last timer interrupt (cyan CPU0, orange CPU1)
+//   18 CPU1 has read the counter (yellow)   19 CPU1 has armed/acknowledged the timer (orange)
+//
+// The same facts go to breadcrumbs in DRAM (CPU0's ACPI parking page + 0xE00, reserved by the
+// firmware and kept over a warm restart); Pxa988SmpDxe logs them on the next boot (cpu1.txt).
 //
 #ifndef GOYA_HALEXT_MARKERS
 #define GOYA_HALEXT_MARKERS 1
@@ -88,6 +93,17 @@ static FORCEINLINE VOID WriteReg(PVOID Base, ULONG Reg, ULONG Value)
 static volatile ULONG *gFb;
 static ULONG gIrqCount;
 static ULONG gQueryCount;
+
+#define HALX_PHYS   0x08180000ULL       // CPU0's parking page (PXA988_PARKING_PAGES)
+#define HALX_OFFSET 0xE00
+#define HALX_MAGIC  0x584C4148          // "HALX"
+enum { HxMagic, HxIrqs, HxIrqsCpu1, HxIrqCpu, HxQueries, HxQueriesCpu1, HxArms, HxArmMode, HxArmTicks, HxCpu1Seen };
+static volatile ULONG *gHx;
+
+static ULONG CurrentCpu(VOID)
+{
+    return _MoveFromCoprocessor(15, 0, 0, 0, 5) & 3;     // MPIDR.Aff0
+}
 
 static VOID Mark(ULONG Slot, ULONG Color)
 {
@@ -120,11 +136,48 @@ static VOID MarkMap(VOID)
         gFb = (volatile ULONG *)HalMapIoSpace(Fb, FB_ROWS * FB_PITCH, MmWriteCombined);
     }
 #endif
+    if (gHx == NULL) {
+        PHYSICAL_ADDRESS Hx;
+        volatile ULONG *Page;
+        ULONG I;
+
+        Hx.QuadPart = HALX_PHYS;
+        Page = (volatile ULONG *)HalMapIoSpace(Hx, 0x1000, MmNonCached);
+        if (Page != NULL) {
+            Page = (volatile ULONG *)((volatile UCHAR *)Page + HALX_OFFSET);
+            for (I = 1; I < 16; I++) {
+                Page[I] = 0;
+            }
+            Page[HxMagic] = HALX_MAGIC;
+            gHx = Page;
+        }
+    }
+}
+
+static VOID Cpu1Seen(ULONG Slot, ULONG Color)
+{
+    if (gHx != NULL) {
+        gHx[HxCpu1Seen]++;
+    }
+    Mark(Slot, Color);
 }
 
 static VOID MarkIrq(VOID)
 {
     ULONG I, V;
+    ULONG Cpu = CurrentCpu();
+
+    if (gHx != NULL) {
+        gHx[HxIrqs]++;
+        gHx[HxIrqCpu] = Cpu;
+        if (Cpu != 0) {
+            gHx[HxIrqsCpu1]++;
+        }
+    }
+    Mark(17, (Cpu == 0) ? C_CYAN : C_ORANGE);
+    if (Cpu != 0) {
+        Cpu1Seen(19, C_ORANGE);
+    }
 
     gIrqCount++;
     Mark(7, (gIrqCount & 1) ? C_MAGENTA : C_GREEN);
@@ -171,6 +224,15 @@ static ULONGLONG HalpMmpCounterQuery(__in PVOID TimerDataPtr)
     ULONG Last;
     ULONG I;
 
+    if (gHx != NULL) {
+        gHx[HxQueries]++;
+    }
+    if (CurrentCpu() != 0) {
+        if (gHx != NULL) {
+            gHx[HxQueriesCpu1]++;
+        }
+        Cpu1Seen(18, C_YELLOW);
+    }
     if ((gQueryCount++ & 0xFFF) == 0) {
         Mark(16, (gQueryCount & 0x1000) ? C_PURPLE : C_BLUE);
     }
@@ -200,11 +262,17 @@ static ULONGLONG HalpMmpCounterQuery(__in PVOID TimerDataPtr)
     // Monotonic: a value slightly behind the last one returned is a bad latch,
     // not a wrap (a wrap is a small positive difference modulo 2^32).
     //
-    Last = gLastCounter;
-    if ((LONG)(Value - Last) < 0 && (Last - Value) < 0x40000000UL) {
-        Value = Last;
+    // Two processors may read at once: update gLastCounter only if no one else did meanwhile.
+    for (;;) {
+        Last = gLastCounter;
+        if ((LONG)(Value - Last) < 0 && (Last - Value) < 0x40000000UL) {
+            Value = Last;
+            break;
+        }
+        if ((ULONG)InterlockedCompareExchange((volatile LONG *)&gLastCounter, (LONG)Value, (LONG)Last) == Last) {
+            break;
+        }
     }
-    gLastCounter = Value;
     return Value;
 }
 
@@ -250,6 +318,15 @@ static NTSTATUS HalpMmpEventArm(__in PVOID TimerDataPtr, __in TIMER_MODE Mode, _
     if (TickCount == 0 || TickCount >= MMP_RESET_MAX_TICKS) {
         Mark(5, C_RED);
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (gHx != NULL) {
+        gHx[HxArms]++;
+        gHx[HxArmMode] = (ULONG)Mode | (CurrentCpu() << 8);
+        gHx[HxArmTicks] = (ULONG)TickCount;
+    }
+    if (CurrentCpu() != 0) {
+        Cpu1Seen(19, C_ORANGE);
     }
 
     switch (Mode) {

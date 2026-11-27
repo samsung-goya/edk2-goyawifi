@@ -79,6 +79,7 @@
   gEfiBootManagerPolicyNetworkGuid
   gEfiBootManagerPolicyConnectAllGuid
   gEfiFileInfoGuid
+  gPxa988TokenSpaceGuid                         ## SOMETIMES_CONSUMES ## Variable:L"Cpu1Status"
   gEfiFileSystemInfoGuid
   gEfiFileSystemVolumeLabelInfoIdGuid
   gEfiEndOfDxeEventGroupGuid

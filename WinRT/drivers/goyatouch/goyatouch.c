@@ -116,7 +116,14 @@
 #define GPIO94_BIT       (1UL << 30)
 #define GPIO_GPLR        0x00
 #define GPIO_GPDR        0x0C
+#define GPIO_GPSR        0x18
+#define GPIO_GPCR        0x24
+#define GPIO_GSDR        0x54
 #define GPIO_GCDR        0x60
+/* TWSI1 pins as GPIOs for the bus recovery: GPIO87 = SCL, GPIO88 = SDA (bank 2, bits 23/24) */
+#define GPIO_TWSI1_BANK  0x008
+#define GPIO87_BIT       (1UL << 23)
+#define GPIO88_BIT       (1UL << 24)
 #define MFPR_GPIO94_PHYS 0xD401E224ULL
 #define SUB_BIT_EXIST     0x01
 /* ESD watchdog as in Samsung's bt532_ts.c: the chip raises an interrupt every 100 scans (~1 s) even
@@ -143,10 +150,13 @@ typedef struct _DEV_EXT {
     BOOLEAN        Removed;
     ULONG          InitTries;
     LONG           LastX, LastY;
-    ULONG          Tick;            /* poll counter (POLL_MS each) */
+    ULONG          Tick;            /* time since the poll thread started, in POLL_MS units (not a poll count:
+                                       the wait lasts a whole system timer period, ~15.6 ms, or more) */
+    ULONG          NextInit;        /* Tick at which the next init try is due */
     ULONG          LastAlive;       /* Tick of the last sign of life from the chip */
     ULONG          LastProbe;       /* Tick of the last register probe by the watchdog */
     BOOLEAN        HbSeen;          /* the chip sent its periodic (heartbeat) interrupt since the last init */
+    ULONG          ReadFailRun;     /* status reads in a row that failed with INT low */
 } DEV_EXT;
 
 /* status shown by the heartbeat thread */
@@ -154,17 +164,44 @@ static volatile ULONG gStage, gInit = 0xFFFFFFFF, gInfo, gChip, gReports;
 static volatile ULONG gLastStatus, gLastSub, gReadFails, gNonZero, gRejected;
 static volatile ULONG gPolls, gRaw4, gReadback, gIntInfo, gIntLow, gWatchdog;
 static PUCHAR gGpio;                 /* mapped GPIO block (read-only use + GCDR) */
+/* TWSI1 clock register (APBC) and bus recovery, shown as "5 8" .. "5 A":
+   gClkDiag  = value found when it was wrong (31:24) | value read back after our fix (23:16) |
+               times it was found wrong (15:0)
+   gRecDiag  = bus recoveries (31:16) | SCL pulses needed last time (15:8) | line levels before (7:4) and
+               after (3:0) the last recovery (bit 1 SDA, bit 0 SCL; 3 = both high)
+   gClkLost  = poll number at which a poll first found the clock wrong (0 = never) */
+static volatile ULONG gClkDiag, gRecDiag, gClkLost;
+static PULONG gClk;
+/* Power-cycle requests to goyabatt (it owns the PMIC bus), through the named notification event
+   \BaseNamedObjects\GoyaTouchPowerCycle: we set it after NAK_CYCLE failed inits in a row in which the
+   chip did not even acknowledge its address, goyabatt switches LDO1 off and on and clears it.
+   Shown as "5 B": requests (31:24) | answered (23:16) | failed inits in a row that were NAKs (15:0). */
+#define NAK_CYCLE        4
+#define CYCLE_GAP_TICKS  (30000 / POLL_MS)     /* at most one request per 30 s */
+static PKEVENT gPwrEv;
+static HANDLE gPwrEvH;
+static volatile ULONG gPwr;
+static ULONG gNakRun, gPwrTick, gNextEvOpen;
+static BOOLEAN gPwrPending;
 
-/* extra status lines below all drivers' values: "5 <n> <value>", n = 2.. */
+/* extra status lines "5 <n> <value>", n = 2.., from row 21 down, in a second column left of the
+   drivers' column: goyasdio (id 8) uses rows 21-23 of that column, and 10 lines would not fit below it
+   (32 rows of 18 px on the 600 px screen) */
 static VOID TraceExtra(ULONG N, ULONG Value)
 {
     PULONG fb = GtFb();
-    ULONG y = 8 + (7 + 6 * 2 + 2 + (N - 2)) * 6 * GT_SCALE, x = GT_FB_W - 12 * 4 * GT_SCALE;
+    ULONG y = 8 + (7 + 7 * 2 + (N - 2)) * 6 * GT_SCALE, x = GT_FB_W - 2 * 12 * 4 * GT_SCALE;
     if (fb == NULL) return;
     x = GtHex(fb, x, y, GOYA_TRACE_ID, 1, 0x00FFFFFF, 0x00202020);
     x = GtHex(fb, x, y, N, 1, 0x00808080, 0x00202020);
     GtHex(fb, x, y, Value, 8, 0x0000FFFF, 0x00202020);
 }
+/* state changes to the boot log (goyalog), stamped with the poll tick in seconds; capped so a dead chip
+   cannot flood it */
+static ULONG gLogLines, gLostTick, gLostRun;
+#define TLOG(E, fmt, ...) do { if (gLogLines < 300) { gLogLines++; \
+    DbgPrint("goyatouch: %u.%02u s " fmt "\n", (E)->Tick / (1000 / POLL_MS), (E)->Tick % (1000 / POLL_MS) * POLL_MS / 10, __VA_ARGS__); } } while (0)
+
 static BOOLEAN gChipOk;
 static KEVENT gHbStop;
 static PKTHREAD gHbThread;
@@ -202,6 +239,10 @@ static VOID HeartbeatThread(PVOID Context)
         TraceExtra(5, gRaw4);
         TraceExtra(6, gIntLow);
         TraceExtra(7, gWatchdog);
+        TraceExtra(8, gClkDiag);
+        TraceExtra(9, gRecDiag);
+        TraceExtra(10, gClk != NULL ? ((READ_REGISTER_ULONG(gClk) & 0xFF) << 24) | (gClkLost & 0xFFFFFF) : 0xEEEEEEEE);
+        TraceExtra(11, gPwrEv != NULL ? (gPwr & 0xFFFF0000) | (gNakRun & 0xFFFF) : 0xEEEEEEEE);
     } while (KeWaitForSingleObject(&gHbStop, Executive, KernelMode, FALSE, &t) == STATUS_TIMEOUT);
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -227,6 +268,7 @@ static VOID I2cReset(DEV_EXT *E)
         if ((v & (APBC_APBCLK | APBC_FNCLK | APBC_RST)) != (APBC_APBCLK | APBC_FNCLK)) {
             WRITE_REGISTER_ULONG(E->Clock, (v & ~APBC_RST) | APBC_APBCLK | APBC_FNCLK);
             KeStallExecutionProcessor(10);
+            gClkDiag = ((v & 0xFF) << 24) | ((READ_REGISTER_ULONG(E->Clock) & 0xFF) << 16) | ((gClkDiag + 1) & 0xFFFF);
         }
     }
     Wr(E, I2C_ICR, ICR_UR);
@@ -276,6 +318,72 @@ static NTSTATUS I2cRx(DEV_EXT *E, PUCHAR Data, BOOLEAN Last)
     st = I2cWait(E, ISR_IRF);
     if (NT_SUCCESS(st)) *Data = (UCHAR)Rd(E, I2C_IDBR);
     return st;
+}
+
+/* Unit reset through the APBC register (RST with the clocks on, then released), as the vendor
+   i2c-pxa does after a hang; the ICR_UR soft reset alone did not bring a timed-out unit back. */
+static VOID I2cHardReset(DEV_EXT *E)
+{
+    if (E->Clock != NULL) {
+        ULONG v = READ_REGISTER_ULONG(E->Clock) & ~(APBC_APBCLK | APBC_FNCLK | APBC_RST);
+        WRITE_REGISTER_ULONG(E->Clock, v | APBC_APBCLK | APBC_FNCLK | APBC_RST);
+        KeStallExecutionProcessor(20);
+        WRITE_REGISTER_ULONG(E->Clock, v | APBC_APBCLK | APBC_FNCLK);
+        KeStallExecutionProcessor(20);
+    }
+}
+
+/* I2C bus recovery (I2C spec 3.1.16): a slave stopped in the middle of a byte holds SDA low until it
+   gets the rest of its clocks. Switch GPIO87/88 to GPIO, release both (the pull-ups take them high),
+   clock SCL up to 9 times until SDA is released, send a STOP, then give the pins back to TWSI1. */
+static ULONG GpioLevels(VOID)
+{
+    ULONG l = READ_REGISTER_ULONG((PULONG)(gGpio + GPIO_TWSI1_BANK + GPIO_GPLR));
+    return ((l & GPIO88_BIT) ? 2 : 0) | ((l & GPIO87_BIT) ? 1 : 0);
+}
+
+static VOID GpioLine(ULONG Bit, BOOLEAN High)
+{
+    PUCHAR b = gGpio + GPIO_TWSI1_BANK;
+    if (High) {
+        WRITE_REGISTER_ULONG((PULONG)(b + GPIO_GCDR), Bit);         /* input: released, pulled up */
+    } else {
+        WRITE_REGISTER_ULONG((PULONG)(b + GPIO_GPCR), Bit);         /* output low */
+        WRITE_REGISTER_ULONG((PULONG)(b + GPIO_GSDR), Bit);
+    }
+    KeStallExecutionProcessor(5);
+}
+
+static VOID I2cBusRecover(VOID)
+{
+    PHYSICAL_ADDRESS pa;
+    PULONG m;
+    ULONG a, b, before, n = 0;
+
+    if (gGpio == NULL) return;
+    pa.QuadPart = MFPR_TWSI1_PHYS;
+    m = (PULONG)MmMapIoSpace(pa, 8, MmNonCached);
+    if (m == NULL) return;
+    a = READ_REGISTER_ULONG(&m[0]);
+    b = READ_REGISTER_ULONG(&m[1]);
+    GpioLine(GPIO87_BIT, TRUE);
+    GpioLine(GPIO88_BIT, TRUE);
+    WRITE_REGISTER_ULONG(&m[0], a & ~7UL);                          /* AF0 = GPIO */
+    WRITE_REGISTER_ULONG(&m[1], b & ~7UL);
+    KeStallExecutionProcessor(10);
+    before = GpioLevels();
+    while (n < 9 && !(GpioLevels() & 2)) {
+        GpioLine(GPIO87_BIT, FALSE);
+        GpioLine(GPIO87_BIT, TRUE);
+        n++;
+    }
+    GpioLine(GPIO88_BIT, FALSE);                                    /* STOP: SDA low -> high while SCL high */
+    GpioLine(GPIO87_BIT, TRUE);
+    GpioLine(GPIO88_BIT, TRUE);
+    gRecDiag = ((gRecDiag + 0x10000) & 0xFFFF0000) | (n << 8) | (before << 4) | GpioLevels();
+    WRITE_REGISTER_ULONG(&m[0], a);
+    WRITE_REGISTER_ULONG(&m[1], b);
+    MmUnmapIoSpace(m, 8);
 }
 
 static VOID I2cRecover(DEV_EXT *E)
@@ -464,9 +572,27 @@ static VOID PollOnce(DEV_EXT *E)
     int i;
 
     gPolls++;
+    if (gClkLost == 0 && E->Clock != NULL &&
+        (READ_REGISTER_ULONG(E->Clock) & (APBC_APBCLK | APBC_FNCLK | APBC_RST)) != (APBC_APBCLK | APBC_FNCLK)) {
+        gClkLost = gPolls;
+    }
     intLow = (BOOLEAN)(gGpio != NULL && !(READ_REGISTER_ULONG((PULONG)(gGpio + GPIO94_BANK + GPIO_GPLR)) & GPIO94_BIT));
     if (intLow) gIntLow++;
-    if (!NT_SUCCESS(ZReadData(E, Z_POINT_STATUS, raw, sizeof(raw)))) {
+    /* Talk to the chip only when it asks (INT low), like the vendor driver. Between scans the chip
+       does not acknowledge its address; reading the status on every poll regardless made it look lost
+       every 10-45 s, and each "recovery" (re-init, recalibration) was a visible touch lag. */
+    if (gGpio != NULL && !intLow) return;
+    {
+    NTSTATUS rs = ZReadData(E, Z_POINT_STATUS, raw, sizeof(raw));
+    if (!NT_SUCCESS(rs)) {
+        /* INT stays low until CLEAR_INT, so the next poll simply tries again: re-init only when the
+           chip keeps refusing */
+        TLOG(E, "status read failed %08x (ISR %04x, lines %u), %u in a row, last interrupt %u ticks ago, finger %s%s",
+             (ULONG)rs, gLastIsr & 0xFFFF, gLastIbmr & 3, E->ReadFailRun + 1, E->Tick - E->LastAlive,
+             E->Down ? "down" : "up", E->ReadFailRun + 1 >= 3 ? " - re-init" : "");
+        if (++E->ReadFailRun < 3) return;
+        E->ReadFailRun = 0;
+        gLostTick = E->Tick;
         gReadFails++;
         gWatchdog = (gWatchdog & 0xFFFF8000) | ((gWatchdog + 1) & 0x7FFF);
         ReleaseButton(E);
@@ -474,6 +600,8 @@ static VOID PollOnce(DEV_EXT *E)
         E->InitTries = 0;
         return;
     }
+    }
+    E->ReadFailRun = 0;
     status = (USHORT)(raw[0] | (raw[1] << 8));
     if (intLow || status != 0) E->LastAlive = E->Tick;      /* an interrupt (touch or heartbeat) */
     gRaw4 = ((ULONG)raw[0] << 24) | ((ULONG)raw[1] << 16) | ((ULONG)raw[2] << 8) | raw[3];
@@ -523,22 +651,74 @@ static VOID PollOnce(DEV_EXT *E)
     E->LastY = y;
 }
 
+/* \BaseNamedObjects only exists once the session manager has run; DriverEntry of a boot-start driver
+   is too early, so the poll thread keeps trying */
+static VOID PowerEventOpen(VOID)
+{
+    UNICODE_STRING n;
+    RtlInitUnicodeString(&n, L"\\BaseNamedObjects\\GoyaTouchPowerCycle");
+    gPwrEv = IoCreateNotificationEvent(&n, &gPwrEvH);
+    if (gPwrEv != NULL) { KeClearEvent(gPwrEv); DbgPrint("goyatouch: GoyaTouchPowerCycle event open\n"); }
+}
+
+/* after a failed init: count NAKs in a row and ask goyabatt for a power cycle */
+static VOID PowerCycleCheck(DEV_EXT *E, NTSTATUS st, ULONG Tick)
+{
+    if (gPwrPending && !KeReadStateEvent(gPwrEv)) {
+        gPwrPending = FALSE;
+        gPwr += 0x10000;                                            /* answered */
+        TLOG(E, "goyabatt power-cycled the supply (%u)", (gPwr >> 16) & 0xFF);
+        E->InitTries = 0;                                           /* back to fast retries */
+        E->NextInit = Tick;
+    }
+    if (st != STATUS_NO_SUCH_DEVICE) { gNakRun = 0; return; }
+    gNakRun++;
+    if (gPwrEv != NULL && !gPwrPending && gNakRun >= NAK_CYCLE &&
+        (gPwrTick == 0 || Tick - gPwrTick > CYCLE_GAP_TICKS)) {
+        gPwrTick = Tick ? Tick : 1;
+        gPwrPending = TRUE;
+        gPwr += 0x1000000;
+        TLOG(E, "%u NAKs in a row: asking goyabatt for a power cycle", gNakRun);
+        KeSetEvent(gPwrEv, IO_NO_INCREMENT, FALSE);
+    }
+}
+
 static VOID PollStep(DEV_EXT *E, ULONG Tick)
 {
     E->Tick = Tick;
+    if (gPwrEv == NULL && (LONG)(Tick - gNextEvOpen) >= 0) { gNextEvOpen = Tick + 5000 / POLL_MS; PowerEventOpen(); }
+    if (gPwrPending && !KeReadStateEvent(gPwrEv)) PowerCycleCheck(E, STATUS_SUCCESS, Tick);
     if (!E->Initialized) {
         /* every 0.5 s for the first 20 tries, then every 5 s (a missing chip costs CPU: polled I2C) */
-        if (Tick % (E->InitTries < 20 ? 50 : 500) == 0) {
+        if ((LONG)(Tick - E->NextInit) >= 0) {
             NTSTATUS st;
+            E->NextInit = Tick + (E->InitTries < 20 ? 500 : 5000) / POLL_MS;
             E->InitTries++;
             st = ZInitChip(E);
             gInit = (ULONG)st;
             if (!NT_SUCCESS(st)) {
+                if (gLostRun == 0 || gLostRun % 10 == 0)
+                    TLOG(E, "init try %u failed %08x (ISR %04x, lines %u)", E->InitTries, (ULONG)st, gLastIsr & 0xFFFF, gLastIbmr & 3);
+                gLostRun++;
+                /* a stuck unit or bus (timeout / bus error, not a plain NAK): reset the unit through the
+                   APBC register and clock the bus free before the next try */
+                if (st == STATUS_IO_TIMEOUT || st == STATUS_IO_DEVICE_ERROR) {
+                    I2cHardReset(E);
+                    I2cBusRecover();
+                    I2cReset(E);
+                }
                 /* slot 1 until the chip answers: bus lines (SDA bit 28, SCL bit 29), APBC TWSI1 clock
                    register (bits 23:16), I2C status register at the failure (bits 15:0) */
                 gInfo = ((gLastIbmr & 3) << 28) | ((E->Clock ? (READ_REGISTER_ULONG(E->Clock) & 0xFF) : 0xEE) << 16) | (gLastIsr & 0xFFFF);
+                PowerCycleCheck(E, st, Tick);
+            } else {
+                gNakRun = 0;
             }
             E->Initialized = (BOOLEAN)NT_SUCCESS(st);
+            if (E->Initialized) {
+                TLOG(E, "chip answering (init try %u, %u failed, %u ticks after it was lost)", E->InitTries, gLostRun, Tick - gLostTick);
+                gLostRun = 0;
+            }
             if (E->Initialized) { E->LastAlive = E->LastProbe = Tick; E->InitTries = 0; E->HbSeen = FALSE; gWatchdog &= ~0x8000UL; }
         }
         return;
@@ -557,6 +737,9 @@ static VOID PollStep(DEV_EXT *E, ULONG Tick)
         if (ok && !(E->HbSeen && !E->Down && Tick - E->LastAlive > WD_LOCK_TICKS)) {
             gWatchdog = (gWatchdog & 0xFF00FFFF) | ((gWatchdog + 0x10000) & 0x00FF0000);   /* probe passed */
         } else {
+            TLOG(E, "watchdog: INT_ENABLE %04x (%s), heartbeat %s, last interrupt %u ticks ago - re-init",
+                 ie, ok ? "kept" : "lost/failed", E->HbSeen ? "seen" : "never", Tick - E->LastAlive);
+            gLostTick = Tick;
             gWatchdog = (gWatchdog & 0x00FFFFFF) | ((gWatchdog + 0x1000000) & 0xFF000000); /* re-init */
             ReleaseButton(E);
             E->Initialized = FALSE;
@@ -572,12 +755,14 @@ static VOID PollThread(PVOID Context)
     DEV_EXT *E = (DEV_EXT *)Context;
     LARGE_INTEGER period;
     ULONG tick = 0;
+    ULONGLONG start = KeQueryInterruptTime();
 
+    E->NextInit = 0;                                    /* the tick restarts with every thread */
     period.QuadPart = -10000LL * POLL_MS;
     while (KeWaitForSingleObject(&E->StopEvent, Executive, KernelMode, FALSE, &period) == STATUS_TIMEOUT) {
         __try { PollStep(E, tick); }
         __except (GoyaTraceFilter(GetExceptionInformation(), 0x01)) { E->Initialized = FALSE; }
-        tick++;
+        tick = (ULONG)((KeQueryInterruptTime() - start) / (10000ULL * POLL_MS));
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -613,6 +798,7 @@ static VOID StopDevice(DEV_EXT *E)
         E->Thread = NULL;
     }
     if (E->Twsi != NULL) { MmUnmapIoSpace(E->Twsi, TWSI1_LEN); E->Twsi = NULL; }
+    gClk = NULL;
     if (E->Clock != NULL) { MmUnmapIoSpace(E->Clock, sizeof(ULONG)); E->Clock = NULL; }
     E->Initialized = FALSE;
     E->Started = FALSE;
@@ -671,6 +857,7 @@ static NTSTATUS StartDevice(DEV_EXT *E)
     E->Twsi = (PUCHAR)MmMapIoSpace(pa, TWSI1_LEN, MmNonCached);
     pa.QuadPart = APBC_TWSI1_PHYS;
     E->Clock = (PULONG)MmMapIoSpace(pa, sizeof(ULONG), MmNonCached);
+    gClk = E->Clock;
     if (E->Twsi == NULL) return STATUS_INSUFFICIENT_RESOURCES;
 
     KeInitializeEvent(&E->StopEvent, NotificationEvent, FALSE);
@@ -842,6 +1029,7 @@ static VOID DriverUnload(PDRIVER_OBJECT Driver)
         ObDereferenceObject(gHbThread);
         gHbThread = NULL;
     }
+    if (gPwrEvH != NULL) { ZwClose(gPwrEvH); gPwrEvH = NULL; gPwrEv = NULL; }
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegistryPath)

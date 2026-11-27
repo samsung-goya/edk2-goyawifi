@@ -178,6 +178,7 @@ static VOID Snapshot(VOID)
 #define GPIO_PHYS 0xD4019000ULL
 #define VOL_BITS  ((1UL << 1) | (1UL << 2))
 static PULONG gGplr;
+static VOID SmpProbe(const char *When);
 
 static VOID SnapshotThread(PVOID Context)
 {
@@ -189,6 +190,7 @@ static VOID SnapshotThread(PVOID Context)
         KeDelayExecutionThread(KernelMode, FALSE, &t);
         Snapshot();                          /* module list every second */
         n++;
+        if (n == 60 && gHdr != NULL) SmpProbe("after 60 s");
         if (gHdr != NULL) {
             gHdr->Uptime = (ULONG)(KeQueryInterruptTime() / 10000000ULL);
             if (n % 60 == 0) {
@@ -474,6 +476,7 @@ static VOID Draw(PULONG fb)
 #define MPMU_PHYS    0xD4050000ULL
 #define WDT_PHYS     0xD4080000ULL
 static volatile UCHAR *gMpmu, *gWdt;
+static ULONG gWdtWasArmed;
 #define MPMU(o) (*(volatile ULONG *)(gMpmu + (o)))
 #define WDT(o)  (*(volatile ULONG *)(gWdt + (o)))
 #define WDT_UNLOCK() (WDT(0x9C) = 0xBABA, WDT(0xA0) = 0xEB10)
@@ -588,6 +591,83 @@ static NTSTATUS ShutdownDispatch(PDEVICE_OBJECT Dev, PIRP Irp)
     return STATUS_SUCCESS;
 }
 
+/* ---- second core: what Windows made of it -------------------------------------------------------
+   The firmware leaves CPU1 in its ACPI parking-protocol page (0x08181000; CPU0's is 0x08180000)
+   and the MADT lists it. Logged: the processor counts, the 8520 hal.dll's processor table (built
+   from the MADT GICC entries; layout and offsets read from its code, this build only) and the two
+   parking pages, where the HAL writes JumpAddress (+8) and ProcessorId (+0) to start a core. */
+#define PARK_PHYS        0x08180000ULL
+#define HAL8520_SIZE     0x3A000
+#define HAL8520_PROC     0x1CBF8      /* struct: +0 table (40-byte entries), +0x24 entries */
+#define HAL8520_STARTED  0x1C2B4      /* processors started */
+#define HAL8520_INTCTRL  0x1CC0C      /* primary interrupt controller: +0x60 type (3 = GIC) */
+
+static VOID LWords(LINE *l, const ULONG *p, ULONG n)
+{
+    ULONG i;
+    for (i = 0; i < n; i++) { LC(l, ' '); LH(l, p[i], 8); }
+}
+
+static ULONG HalBase(VOID)
+{
+    MODLIST *m;
+    ULONG i;
+    if (gActive < 0) return 0;
+    m = (MODLIST *)gList[gActive];
+    for (i = 0; i < ListCount(gList[gActive]); i++) {
+        USHORT o = m->M[i].OffsetToFileName;
+        const char *nm = (const char *)m->M[i].FullPathName + (o < 255 ? o : 0);
+        if (_stricmp(nm, "hal.dll") == 0)
+            return m->M[i].ImageSize == HAL8520_SIZE ? (ULONG)(ULONG_PTR)m->M[i].ImageBase : 0;
+    }
+    return 0;
+}
+
+static VOID SmpProbe(const char *When)
+{
+    PHYSICAL_ADDRESS pa;
+    PULONG park;
+    ULONG hal, i;
+    LINE l;
+
+    LBegin(&l); LS(&l, "smp "); LS(&l, When); LS(&l, ": active ");
+    LD(&l, KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)); LS(&l, ", max ");
+    LD(&l, KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS)); LS(&l, ", this CPU ");
+    LD(&l, KeGetCurrentProcessorNumberEx(NULL)); LEnd(&l);
+
+    hal = HalBase();
+    if (hal != 0 && MmIsAddressValid((PVOID)(ULONG_PTR)(hal + HAL8520_PROC))) {
+        const ULONG *s = (const ULONG *)(ULONG_PTR)(hal + HAL8520_PROC);
+        const ULONG *ic = *(const ULONG * const *)(ULONG_PTR)(hal + HAL8520_INTCTRL);
+        LBegin(&l); LS(&l, "smp hal "); LH(&l, hal, 8); LS(&l, " proc struct:"); LWords(&l, s, 12); LEnd(&l);
+        LBegin(&l); LS(&l, "smp hal started "); LH(&l, *(const ULONG *)(ULONG_PTR)(hal + HAL8520_STARTED), 8);
+        LS(&l, ", interrupt controller type ");
+        if (ic != NULL && MmIsAddressValid((PVOID)(ic + 0x18))) LH(&l, ic[0x18], 8); else LS(&l, "?");
+        LEnd(&l);
+        if (s[0] != 0 && s[9] <= 4 && MmIsAddressValid((PVOID)(ULONG_PTR)s[0])) {
+            for (i = 0; i < s[9]; i++) {
+                LBegin(&l); LS(&l, "smp hal cpu "); LD(&l, i); LC(&l, ':');
+                LWords(&l, (const ULONG *)(ULONG_PTR)(s[0] + i * 40), 10); LEnd(&l);
+            }
+        }
+    } else {
+        LogS("smp hal: not the 8520 hal.dll layout, not read");
+    }
+
+    pa.QuadPart = PARK_PHYS;
+    park = (PULONG)MmMapIoSpace(pa, 0x2000, MmNonCached);
+    if (park != NULL) {
+        for (i = 0; i < 2; i++) {
+            const ULONG *p = park + i * 0x400;
+            LBegin(&l); LS(&l, "smp parking page "); LD(&l, i); LC(&l, ':'); LWords(&l, p, 8);
+            LS(&l, " | +7F8"); LWords(&l, p + 0x1FE, 2);
+            LS(&l, " | mailbox state "); LH(&l, p[0x3C9], 8); LS(&l, " wakes "); LD(&l, p[0x3CA]);
+            LEnd(&l);
+        }
+        MmUnmapIoSpace(park, 0x2000);
+    }
+}
+
 static VOID LogInit(PDRIVER_OBJECT Driver)
 {
     PHYSICAL_ADDRESS pa;
@@ -601,6 +681,12 @@ static VOID LogInit(PDRIVER_OBJECT Driver)
     gLog = (volatile UCHAR *)MmMapIoSpace(pa, GOYALOG_SIZE, MmNonCached);
     pa.QuadPart = MPMU_PHYS; gMpmu = (volatile UCHAR *)MmMapIoSpace(pa, 0x2000, MmNonCached);
     pa.QuadPart = WDT_PHYS;  gWdt  = (volatile UCHAR *)MmMapIoSpace(pa, 0x1000, MmNonCached);
+    /* the firmware arms the watchdog at ExitBootServices as a hang guard for the early boot (second
+       core bring-up); goyabug loading means the boot got this far */
+    if (gWdt != NULL) {
+        gWdtWasArmed = WDT(0x64);
+        if (gWdtWasArmed & 1) { WDT_UNLOCK(); WDT(0x64) = 0; }
+    }
     if (gLog == NULL) return;
 
     {
@@ -654,6 +740,10 @@ static VOID LogInit(PDRIVER_OBJECT Driver)
         dev->Flags &= ~DO_DEVICE_INITIALIZING;
         LogS(NT_SUCCESS(IoRegisterShutdownNotification(dev)) ? "shutdown notification on" : "shutdown notification FAILED");
     }
+
+    LBegin(&l); LS(&l, "firmware watchdog (WMER "); LH(&l, gWdtWasArmed, 2);
+    LS(&l, (gWdtWasArmed & 1) ? ") was armed, disarmed" : ") was not armed"); LEnd(&l);
+    SmpProbe("at goyabug start");
 }
 
 /* ---- entry ------------------------------------------------------------------------------------- */

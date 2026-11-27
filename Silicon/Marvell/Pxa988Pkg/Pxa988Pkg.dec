@@ -19,6 +19,10 @@
 [Guids]
   gPxa988TokenSpaceGuid = { 0x2e8c6b1a, 0x9f4d, 0x4c2b, { 0x8a, 0x61, 0x3d, 0x5f, 0x0e, 0x7a, 0x92, 0xb4 } }
 
+[Protocols]
+  # Pxa988SmpDxe -> GoyaWifiAcpiDxe: ACPI parking-protocol pages (Include/Protocol/Pxa988Cpu1Parking.h)
+  gPxa988Cpu1ParkingProtocolGuid = { 0x2cb0485d, 0x6021, 0x4344, { 0x90, 0xd3, 0x8c, 0x3e, 0xa6, 0x8d, 0x07, 0x00 } }
+
 [PcdsFixedAtBuild]
   # simple-framebuffer left by the vendor bootloader
   gPxa988TokenSpaceGuid.PcdFrameBufferBase|0x17000000|UINT32|0x00000001
@@ -34,9 +38,11 @@
   gPxa988TokenSpaceGuid.PcdFbLogScale|1|UINT32|0x00000013
   # Which SDHCI controllers to expose (bit0 = SDH1 microSD, bit2 = SDH3 eMMC)
   gPxa988TokenSpaceGuid.PcdSdhciMask|0x5|UINT32|0x00000020
-  # Bring up the second Cortex-A9 core at boot to prove it works, then put it
-  # back into reset before ExitBootServices (the OS releases it itself)
+  # Bring up the second Cortex-A9 core at boot to prove it works
   gPxa988TokenSpaceGuid.PcdSecondaryCpuBringup|TRUE|BOOLEAN|0x00000030
+  # Then leave it waiting for the OS in an ACPI parking-protocol page (MADT GICC
+  # enabled). FALSE: put it back into reset before ExitBootServices, MADT CPU1 off.
+  gPxa988TokenSpaceGuid.PcdCpu1ParkingProtocol|TRUE|BOOLEAN|0x00000033
   # Register the USB 2.0 OTG controller as a USB host (EHCI) at boot
   gPxa988TokenSpaceGuid.PcdUsbHostEnable|TRUE|BOOLEAN|0x00000031
   # Move the CPU to the 1066 MHz operating point at boot (Pxa988DvfsDxe)

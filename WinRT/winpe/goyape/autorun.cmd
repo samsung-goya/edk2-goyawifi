@@ -71,6 +71,23 @@ set DRV=%WIN%\Windows\System32\drivers
 for %%f in ("%~dp0install\*.sys") do call :instdrv %%~nf
 :noinstall
 
+rem ---- halext.flag: replace the timer HAL extension, System32\HalExtMmpTimer.dll on the Windows RT
+rem partition, with .\install\HalExtMmpTimer.dll (the first replaced copy is kept as .dll.old) and
+rem byte-compare it. ----
+if not exist "%~dp0halext.flag" goto nohalext
+move /y "%~dp0halext.flag" "%~dp0halext.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SYSTEM if /i not "%%d:"=="%~d0" set WIN=%%d:
+echo --- HAL extension into %WIN% >> "%OUT%"
+if not defined WIN (echo no Windows partition found >> "%OUT%" & goto nohalext)
+if not exist "%~dp0install\HalExtMmpTimer.dll" (echo no install\HalExtMmpTimer.dll >> "%OUT%" & goto nohalext)
+set HX=%WIN%\Windows\System32\HalExtMmpTimer.dll
+if exist %HX% if not exist %HX%.old copy /b /y %HX% %HX%.old >nul
+copy /b /y "%~dp0install\HalExtMmpTimer.dll" %HX% >> "%OUT%" 2>&1
+"%~dp0goyacmp.exe" "%~dp0install\HalExtMmpTimer.dll" %HX% >> "%OUT%" 2>&1
+echo System32\HalExtMmpTimer.dll compare exit code %ERRORLEVEL% >> "%OUT%"
+:nohalext
+
 rem ---- adddrv.flag: add every driver package in .\adddrv\ (NAME.inf + .sys + .cat) to the Windows RT
 rem install's driver store with DISM, for a device that has no driver yet (install.flag only replaces
 rem the files of drivers that are installed already). Windows installs it when it finds the device. ----
@@ -82,6 +99,85 @@ echo --- add driver packages from .\adddrv to %WIN% >> "%OUT%"
 if not defined WIN (echo no Windows partition found >> "%OUT%" & goto noadddrv)
 for %%f in ("%~dp0adddrv\*.inf") do call :adddrv "%%f"
 :noadddrv
+
+rem ---- redrv.flag: one hardware ID per line (e.g. ACPI\MRVL0009). Every device instance of it in the
+rem offline install loses its Service value and gets ConfigFlags 0x20 (CONFIGFLAG_REINSTALL), so Windows
+rem picks the best driver from its driver store again at the next boot (after packages were added with
+rem DISM on a PC, add-drivers-sd.cmd). Undoes a :regdrv binding. The Enum keys are only writable as
+rem SYSTEM, which WinPE is. The SYSTEM hive is copied to .\redrv-SYSTEM.before first. ----
+if not exist "%~dp0redrv.flag" goto noredrv
+move /y "%~dp0redrv.flag" "%~dp0redrv.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SYSTEM if /i not "%%d:"=="%~d0" set WIN=%%d:
+echo --- redrv: reinstall drivers for the IDs in redrv.done on %WIN% >> "%OUT%"
+if not defined WIN (echo no Windows partition found >> "%OUT%" & goto noredrv)
+copy /b /y %WIN%\Windows\System32\config\SYSTEM "%~dp0redrv-SYSTEM.before" >> "%OUT%" 2>&1
+if errorlevel 1 (echo hive backup failed, registry not changed >> "%OUT%" & goto noredrv)
+reg load HKLM\GOYAREG %WIN%\Windows\System32\config\SYSTEM >> "%OUT%" 2>&1
+if errorlevel 1 (echo hive load failed >> "%OUT%" & goto noredrv)
+set CS=1
+for /f "tokens=3" %%v in ('reg query HKLM\GOYAREG\Select /v Current ^| find "Current"') do set /a CS=%%v
+set CS=000%CS%
+set RK=HKLM\GOYAREG\ControlSet%CS:~-3%
+for /f "usebackq eol=; delims=" %%h in ("%~dp0redrv.done") do call :redrvid "%%h"
+reg unload HKLM\GOYAREG >> "%OUT%" 2>&1
+:noredrv
+
+rem ---- pnpinst.flag: install driver packages from inside Windows RT, where pnputil works (DISM does not
+rem in this WinPE, and a PC may not load this image's hives either). .\pnpinst\ (goya-pnpinst.cmd,
+rem pnpinst.list, the packages and GoyaTestCert.cer) is copied to C:\goya\pnpinst and an HKLM RunOnce
+rem entry runs goya-pnpinst.cmd at the next logon; it leaves goyape\pnpinst-result.log on this card. ----
+if not exist "%~dp0pnpinst.flag" goto nopnpinst
+move /y "%~dp0pnpinst.flag" "%~dp0pnpinst.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SOFTWARE if /i not "%%d:"=="%~d0" set WIN=%%d:
+echo --- pnpinst: stage .\pnpinst on %WIN% and set RunOnce >> "%OUT%"
+if not defined WIN (echo no Windows partition found >> "%OUT%" & goto nopnpinst)
+if not exist %WIN%\goya\pnpinst mkdir %WIN%\goya\pnpinst
+xcopy /y /q "%~dp0pnpinst\*" %WIN%\goya\pnpinst\ >> "%OUT%" 2>&1
+reg load HKLM\GOYASW %WIN%\Windows\System32\config\SOFTWARE >> "%OUT%" 2>&1
+if errorlevel 1 (echo SOFTWARE hive load failed >> "%OUT%" & goto nopnpinst)
+reg add "HKLM\GOYASW\Microsoft\Windows\CurrentVersion\RunOnce" /v GoyaPnpInst /t REG_SZ /d "cmd.exe /c C:\goya\pnpinst\goya-pnpinst.cmd" /f >> "%OUT%" 2>&1
+reg query "HKLM\GOYASW\Microsoft\Windows\CurrentVersion\RunOnce" >> "%OUT%" 2>&1
+reg unload HKLM\GOYASW >> "%OUT%" 2>&1
+:nopnpinst
+
+rem ---- wifireg.flag: one "name value" pair per line (DWORD, decimal or 0x hex), set in the installed
+rem Marvell 88W8777 Wi-Fi driver's key (Net class instance whose MatchingDeviceId has PID_9131) in the
+rem offline SYSTEM hive: the driver reads its settings from there, and re-running pnputil with an unchanged
+rem package would not rewrite them. The hive is copied to .\wifireg-SYSTEM.before first. ----
+if not exist "%~dp0wifireg.flag" goto nowifireg
+move /y "%~dp0wifireg.flag" "%~dp0wifireg.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SYSTEM if /i not "%%d:"=="%~d0" set WIN=%%d:
+echo --- wifireg: Wi-Fi driver settings from wifireg.done on %WIN% >> "%OUT%"
+if not defined WIN (echo no Windows partition found >> "%OUT%" & goto nowifireg)
+copy /b /y %WIN%\Windows\System32\config\SYSTEM "%~dp0wifireg-SYSTEM.before" >> "%OUT%" 2>&1
+if errorlevel 1 (echo hive backup failed, registry not changed >> "%OUT%" & goto nowifireg)
+reg load HKLM\GOYAREG %WIN%\Windows\System32\config\SYSTEM >> "%OUT%" 2>&1
+if errorlevel 1 (echo hive load failed >> "%OUT%" & goto nowifireg)
+set CS=1
+for /f "tokens=3" %%v in ('reg query HKLM\GOYAREG\Select /v Current ^| find "Current"') do set /a CS=%%v
+set CS=000%CS%
+set RK=HKLM\GOYAREG\ControlSet%CS:~-3%
+set WRN=0
+for /f "delims=" %%k in ('reg query "%RK%\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}" /s /f "PID_9131" /d ^| find "HKEY_"') do call :wifiregkey "%%k"
+if "%WRN%"=="0" echo no Net class key with PID_9131 found >> "%OUT%"
+reg unload HKLM\GOYAREG >> "%OUT%" 2>&1
+:nowifireg
+
+rem ---- desktop.flag: copy .\desktop\*.lnk (made by WinRT\install\make-desktop-links.ps1) to the Public
+rem Desktop of the Windows RT partition, so every user gets them. ----
+if not exist "%~dp0desktop.flag" goto nodesktop
+move /y "%~dp0desktop.flag" "%~dp0desktop.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SYSTEM if /i not "%%d:"=="%~d0" set WIN=%%d:
+echo --- desktop: shortcuts to %WIN%\Users\Public\Desktop >> "%OUT%"
+if not defined WIN (echo no Windows partition found >> "%OUT%" & goto nodesktop)
+if not exist "%WIN%\Users\Public\Desktop" mkdir "%WIN%\Users\Public\Desktop"
+xcopy /y "%~dp0desktop\*.lnk" "%WIN%\Users\Public\Desktop\" >> "%OUT%" 2>&1
+dir /b "%WIN%\Users\Public\Desktop" >> "%OUT%" 2>&1
+:nodesktop
 
 rem ---- setuplogs.flag: copy Windows Setup's logs from the Windows RT partition to .\setuplogs\ ----
 if not exist "%~dp0setuplogs.flag" goto nosetuplogs
@@ -234,6 +330,64 @@ move /y %WIN%\Windows\Panther\SetupInfo* "%~dp0setuplogs\blackboard\" >> "%OUT%"
 dir /a %WIN%\Windows\Panther >> "%OUT%" 2>&1
 :noresetsetup
 
+rem ---- cpudiag.flag: what the last Windows RT boot made of the processors: its processor devices
+rem (Enum\ACPI\ACPI0007) and processor settings, plus copies of its SYSTEM hive and System event
+rem log, into .\setuplogs\cpudiag\ (read-only for Windows). ----
+if not exist "%~dp0cpudiag.flag" goto nocpudiag
+move /y "%~dp0cpudiag.flag" "%~dp0cpudiag.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SYSTEM if /i not "%%d:"=="%~d0" set WIN=%%d:
+if not exist "%~dp0setuplogs\cpudiag" mkdir "%~dp0setuplogs\cpudiag"
+set P=%~dp0setuplogs\cpudiag\cpudiag.txt
+echo === cpudiag %DATE% %TIME%, Windows %WIN% > "%P%"
+if not defined WIN goto nocpudiag
+copy /b /y %WIN%\Windows\System32\config\SYSTEM "%~dp0setuplogs\cpudiag\SYSTEM" >> "%P%" 2>&1
+copy /b /y %WIN%\Windows\System32\winevt\Logs\System.evtx "%~dp0setuplogs\cpudiag\System.evtx" >> "%P%" 2>&1
+reg load HKLM\GOYACPU %WIN%\Windows\System32\config\SYSTEM >> "%P%" 2>&1
+reg query HKLM\GOYACPU\ControlSet001\Enum\ACPI\ACPI0007 /s >> "%P%" 2>&1
+reg query "HKLM\GOYACPU\ControlSet001\Control\Session Manager\Kernel" >>"%P%" 2>&1
+reg query HKLM\GOYACPU\ControlSet001\Control\Processor >> "%P%" 2>&1
+reg unload HKLM\GOYACPU >> "%P%" 2>&1
+echo --- System log, errors and warnings, newest first >> "%P%"
+wevtutil qe "%~dp0setuplogs\cpudiag\System.evtx" /lf:true /q:"*[System[(Level<=3)]]" /f:text /c:80 /rd:true >> "%P%" 2>&1
+:nocpudiag
+
+rem ---- noautoreboot.flag (0 or 1): Windows RT's restart after a stop (CrashControl\AutoReboot).
+rem 0 keeps the stop screen up, with its parameters (DisplayParameters), for stops that happen
+rem before goyabug loads. ----
+if not exist "%~dp0noautoreboot.flag" goto nonoautoreboot
+set NAR=
+set /p NAR=<"%~dp0noautoreboot.flag"
+move /y "%~dp0noautoreboot.flag" "%~dp0noautoreboot.done" >nul
+set WIN=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if not defined WIN if exist %%d:\Windows\System32\config\SYSTEM if /i not "%%d:"=="%~d0" set WIN=%%d:
+echo --- Windows RT AutoReboot %NAR% in %WIN% >> "%OUT%"
+if not defined WIN goto nonoautoreboot
+reg load HKLM\GOYACC %WIN%\Windows\System32\config\SYSTEM >> "%OUT%" 2>&1
+reg add HKLM\GOYACC\ControlSet001\Control\CrashControl /v AutoReboot /t REG_DWORD /d %NAR:~0,1% /f >> "%OUT%" 2>&1
+reg add HKLM\GOYACC\ControlSet001\Control\CrashControl /v DisplayParameters /t REG_DWORD /d 1 /f >> "%OUT%" 2>&1
+reg query HKLM\GOYACC\ControlSet001\Control\CrashControl >> "%OUT%" 2>&1
+reg unload HKLM\GOYACC >> "%OUT%" 2>&1
+:nonoautoreboot
+
+rem ---- cpus.flag (1 or 2): how many CPUs Windows RT may use. 1 = bcdedit onecpu on (what the
+rem installer sets), 2 = onecpu removed, for firmware that leaves CPU1 waiting in its ACPI parking
+rem page (MADT CPU1 enabled). The entry is the one in winrt.flag / winrt.done, else {default}. ----
+if not exist "%~dp0cpus.flag" goto nocpus
+set NCPU=
+set /p NCPU=<"%~dp0cpus.flag"
+move /y "%~dp0cpus.flag" "%~dp0cpus.done" >nul
+set CPUID=
+if exist "%~dp0winrt.done" set /p CPUID=<"%~dp0winrt.done"
+if exist "%~dp0winrt.flag" set /p CPUID=<"%~dp0winrt.flag"
+if not defined CPUID set CPUID={default}
+echo --- CPUs for Windows RT %CPUID%: %NCPU% >> "%OUT%"
+set BCDS="%~d0\EFI\Microsoft\Boot\BCD"
+if "%NCPU:~0,1%"=="1" (bcdedit /store %BCDS% /set %CPUID% onecpu on >> "%OUT%" 2>&1) else (bcdedit /store %BCDS% /deletevalue %CPUID% onecpu >> "%OUT%" 2>&1)
+echo bcdedit exit code %ERRORLEVEL% >> "%OUT%"
+bcdedit /store %BCDS% /enum %CPUID% >> "%OUT%" 2>&1
+:nocpus
+
 rem ---- winrt.flag (holds the BCD id of the Windows RT entry): boot Windows RT once. The boot after
 rem that comes back to WinPE (bootsequence is one-shot), where twrp.flag, left in place, goes to TWRP;
 rem the firmware saves the Windows boot's log to \goya\logs on the way. ----
@@ -242,6 +396,9 @@ set RTID=
 set /p RTID=<"%~dp0winrt.flag"
 move /y "%~dp0winrt.flag" "%~dp0winrt.done" >nul
 echo --- one-time boot of Windows RT %RTID% at %TIME% >> "%OUT%"
+rem after a Windows boot that did not finish, bootmgr starts the recovery sequence instead, whose
+rem winload.exe this install does not have (0xc000000f): always boot Windows itself
+bcdedit /store "%~d0\EFI\Microsoft\Boot\BCD" /set %RTID% recoveryenabled No >> "%OUT%" 2>&1
 bcdedit /store "%~d0\EFI\Microsoft\Boot\BCD" /bootsequence %RTID% >> "%OUT%" 2>&1
 echo bcdedit exit code %ERRORLEVEL% >> "%OUT%"
 if errorlevel 1 goto nowinrt
@@ -315,6 +472,23 @@ reg query %RK%\Services\%RN% /s >> "%OUT%" 2>&1
 reg unload HKLM\GOYAREG >> "%OUT%" 2>&1
 goto :eof
 
+rem ---- :redrvid HWID - every instance of one hardware ID (see redrv.flag) ----
+:redrvid
+echo %~1 >> "%OUT%"
+reg query "%RK%\Enum\%~1" >nul 2>&1
+if errorlevel 1 (echo   not in the registry >> "%OUT%" & goto :eof)
+for /f "delims=" %%i in ('reg query "%RK%\Enum\%~1" ^| find "HKEY_"') do call :redrvdev "%%i"
+goto :eof
+
+:redrvdev
+reg query "%~1" /v HardwareID >nul 2>&1
+if errorlevel 1 goto :eof
+echo   %~1 >> "%OUT%"
+reg query "%~1" /v Service >> "%OUT%" 2>&1
+reg delete "%~1" /v Service /f >> "%OUT%" 2>&1
+reg add "%~1" /v ConfigFlags /t REG_DWORD /d 32 /f >> "%OUT%" 2>&1
+goto :eof
+
 rem ---- :regdev KEY - one device instance key (subkeys without a HardwareID value are skipped) ----
 :regdev
 echo device %~1 >> "%OUT%"
@@ -351,4 +525,13 @@ rem ---- :compare NAME - byte compare of boot.wim and its NTFS copy with goyacmp
 echo compare %1 start %TIME% >> "%OUT%"
 "%~dp0goyacmp.exe" "%~d0\sources\boot.wim" %WIN%\goya\bench.tmp >> "%OUT%" 2>&1
 echo compare %1 end   %TIME%  exit code %ERRORLEVEL% >> "%OUT%"
+goto :eof
+
+:wifiregkey
+set /a WRN+=1
+echo key %~1 >> "%OUT%"
+for /f "usebackq eol=; tokens=1,2" %%a in ("%~dp0wifireg.done") do (
+    reg add "%~1" /v %%a /t REG_DWORD /d %%b /f >> "%OUT%" 2>&1
+    reg query "%~1" /v %%a >> "%OUT%" 2>&1
+)
 goto :eof

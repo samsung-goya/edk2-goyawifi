@@ -344,6 +344,175 @@ static NTSTATUS GsQueryId(PGS_PDO p, BUS_QUERY_ID_TYPE type, PWCHAR *out)
 
 /* ---- request processing (PASSIVE_LEVEL, bus lock taken here) ---- */
 
+/* Bring-up trace to the boot log (goyalog): up to GS_TRACE_REQS requests, then only failures (below).
+   The firmware download loop (CMD53 writes to the function 1 data port 0x10000 and the CMD52 polls of
+   its status 0x30 and length 0x40/0x41) is only shown for its first GS_TRACE_LOOP requests and then
+   counted, so what the driver does after the download still fits. Rejected IOCTLs and unhandled PnP
+   requests are logged separately. */
+#define GS_TRACE_REQS 600
+#define GS_TRACE_LOOP 40
+static volatile LONG gTraceReqs, gTraceOther, gTraceLoop, gTraceSkipped, gTraceSawRead, gTraceInts;
+
+static BOOLEAN GsIsDownloadLoop(PGS_REQUEST_PACKET r)
+{
+    ULONG a, addr;
+    if (r->RequestFunction != SDRF_DEVICE_COMMAND || gTraceSawRead) return FALSE;  /* reads: download is over */
+    a = r->Parameters.DeviceCommand.Argument;
+    addr = (a >> 9) & 0x1FFFF;
+    if (((a >> 28) & 7) != 1) return FALSE;
+    if (r->Parameters.DeviceCommand.CmdDesc.Cmd == 53) return (a >> 31) && addr == 0x10000;
+    return !(a >> 31) && (addr == 0x30 || addr == 0x40 || addr == 0x41);
+}
+
+/* Bring-up: the Marvell driver's own log. goyawifi.sys (mwls97w8arm.sys 14.62.17215.91) formats its MOAL/MLAN
+   messages ("[MOAL file line func] text") into a ring in its .data: control block at RVA 0x11eba8, +16 the
+   message mask, +24 the enable flag, 512 entries of 192 bytes at +0x1c, counter at +0x1801c (pre-increment,
+   entry = counter & 511). Nothing reads the ring on Windows RT, so goyasdio finds the image from the interrupt
+   callback the driver registers, checks it is that build ("moal_main.cpp" at RVA 0x85984), turns the log on
+   and copies new entries to the boot log as requests go by. */
+NTSYSAPI PVOID NTAPI RtlPcToFileHeader(PVOID PcValue, PVOID *BaseOfImage);
+#define GW_LOG_RVA      0x11eba8
+#define GW_LOG_NAME_RVA 0x85984
+/* MLAN debug classes: MSG 1, FATAL 2, ERROR 4, DATA 8, CMND 0x10, EVENT 0x20, IOCTL 0x80, MPA_D 0x8000, DAT_D 0x10000,
+   CMD_D 0x20000, EVT_D 0x40000, WARN 0x20000000, HEX_DUMP 0x80000000,
+   INFO 0x40000000 (not INTR, FW_D/IF_D (every download block) or ENTRY) */
+#define GW_LOG_MASK     0xE00780BF
+static PUCHAR gWifiLog;
+static LONG gWifiLogSeen;
+static volatile LONG gWifiLogBusy;
+
+static VOID GsWifiLogArm(VOID)
+{
+    if (!gWifiLog) return;
+    if (*(volatile ULONG *)(gWifiLog + 16) != GW_LOG_MASK) *(volatile ULONG *)(gWifiLog + 16) = GW_LOG_MASK;
+    if (*(volatile ULONG *)(gWifiLog + 24) != 1) *(volatile ULONG *)(gWifiLog + 24) = 1;
+}
+
+static VOID GsWifiLogAttach(PVOID routine)
+{
+    PVOID base = NULL;
+    if (gWifiLog || !routine) return;
+    RtlPcToFileHeader(routine, &base);
+    if (!base || RtlCompareMemory((PUCHAR)base + GW_LOG_NAME_RVA, "moal_main.cpp", 14) != 14) {
+        DbgPrint("goyasdio: function driver at %p is not the known Marvell build: its log stays off\n", base);
+        return;
+    }
+    gWifiLog = (PUCHAR)base + GW_LOG_RVA;
+    gWifiLogSeen = *(volatile LONG *)(gWifiLog + 0x1801c);
+    GsWifiLogArm();
+    DbgPrint("goyasdio: Marvell driver at %p, its log turned on (counter %d)\n", base, gWifiLogSeen);
+}
+
+static VOID GsWifiLogDump(VOID)
+{
+    LONG n, i;
+    char line[193];
+    if (!gWifiLog || InterlockedExchange(&gWifiLogBusy, 1)) return;
+    GsWifiLogArm();
+    n = *(volatile LONG *)(gWifiLog + 0x1801c);
+    if (n - gWifiLogSeen > 511) {
+        DbgPrint("mrvl: ... %d messages lost\n", n - gWifiLogSeen - 511);
+        gWifiLogSeen = n - 511;
+    }
+    for (i = gWifiLogSeen + 1; i - n <= 0; i++) {
+        ULONG k;
+        RtlCopyMemory(line, gWifiLog + 0x1c + (i & 511) * 192, 192);
+        line[192] = 0;
+        for (k = 0; line[k]; k++) if (line[k] == '\n' || line[k] == '\r') line[k] = ' ';
+        DbgPrint("mrvl: %s\n", line);
+    }
+    gWifiLogSeen = n;
+    InterlockedExchange(&gWifiLogBusy, 0);
+}
+
+/* Data ports (function 1, 0x10001..0x1FFFF: ports 1-15 and multi-port aggregation; port 0 at 0x10000 carries
+   commands and events): the first GS_TRACE_DATA transfers with their first 96 bytes, apart from the request
+   cap above, to see the data path (TxPD/RxPD, 802.3 header, EAPOL 0x888e) once a connection starts. */
+#define GS_TRACE_DATA 120
+static volatile LONG gTraceData;
+
+static VOID GsTraceData(PGS_PDO p, PGS_REQUEST_PACKET r, NTSTATUS s)
+{
+    ULONG a, addr, len, i, o, n;
+    PMDL mdl;
+    PUCHAR va;
+    static const char hd[] = "0123456789abcdef";
+    if (r->RequestFunction != SDRF_DEVICE_COMMAND || r->Parameters.DeviceCommand.CmdDesc.Cmd != 53) return;
+    a = r->Parameters.DeviceCommand.Argument;
+    addr = (a >> 9) & 0x1FFFF;
+    if (((a >> 28) & 7) != 1 || addr <= 0x10000 || !gTraceSawRead) return;
+    if (InterlockedIncrement(&gTraceData) > GS_TRACE_DATA) return;
+    len = r->Parameters.DeviceCommand.Length;
+    mdl = r->Parameters.DeviceCommand.Mdl;
+    va = (mdl && len) ? (PUCHAR)MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority) : NULL;
+    DbgPrint("goyasdio: f%u data %s port 0x%05x %s len %u st %08x\n", p->Fn, (a >> 31) ? "W" : "R", addr,
+             (a & (1UL << 27)) ? "blk" : "byte", len, s);
+    if (!va) return;
+    n = len < 96 ? len : 96;
+    for (o = 0; o < n; o += 32) {
+        char hex[3 * 32 + 1];
+        ULONG m = n - o < 32 ? n - o : 32;
+        for (i = 0; i < m; i++) {
+            hex[3 * i] = hd[va[o + i] >> 4];
+            hex[3 * i + 1] = hd[va[o + i] & 15];
+            hex[3 * i + 2] = ' ';
+        }
+        hex[3 * m] = 0;
+        DbgPrint("goyasdio:   +%02x %s\n", o, hex);
+    }
+}
+
+static VOID GsTraceReq(PGS_PDO p, PGS_REQUEST_PACKET r, NTSTATUS s)
+{
+    GsWifiLogDump();
+    GsTraceData(p, r, s);
+    if (GsIsDownloadLoop(r) && InterlockedIncrement(&gTraceLoop) > GS_TRACE_LOOP) {
+        InterlockedIncrement(&gTraceSkipped);
+        return;
+    }
+    if (InterlockedIncrement(&gTraceReqs) > GS_TRACE_REQS) return;
+    if (gTraceSkipped) {
+        DbgPrint("goyasdio: ... %d download-loop requests not shown (%d CMD53 so far, %u bus errors)\n",
+                 InterlockedExchange(&gTraceSkipped, 0), p->Fdo ? p->Fdo->Sd.Cmd53s : 0, p->Fdo ? p->Fdo->Sd.Errors : 0);
+    }
+    if (r->RequestFunction == SDRF_DEVICE_COMMAND) {
+        ULONG a = r->Parameters.DeviceCommand.Argument;
+        UCHAR cmd = r->Parameters.DeviceCommand.CmdDesc.Cmd;
+        ULONG r5 = 0;
+        RtlCopyMemory(&r5, r->ResponseData, 4);
+        if (cmd == 52)
+            DbgPrint("goyasdio: f%u CMD52 %s fn%u 0x%05x = %02x -> %02x st %08x\n", p->Fn, (a >> 31) ? "W" : "R",
+                     (a >> 28) & 7, (a >> 9) & 0x1FFFF, a & 0xFF, r5 & 0xFF, s);
+        else {
+            ULONG len = r->Parameters.DeviceCommand.Length, i, n;
+            PMDL mdl = r->Parameters.DeviceCommand.Mdl;
+            PUCHAR va = (mdl && len) ? (PUCHAR)MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority) : NULL;
+            char hex[3 * 32 + 1];
+            static const char hd[] = "0123456789abcdef";
+            if (cmd == 53 && !(a >> 31)) InterlockedExchange(&gTraceSawRead, 1);
+            n = len < 32 ? len : 32;
+            hex[0] = 0;
+            if (va && gTraceSawRead) {
+                for (i = 0; i < n; i++) {
+                    hex[3 * i] = hd[va[i] >> 4];
+                    hex[3 * i + 1] = hd[va[i] & 15];
+                    hex[3 * i + 2] = ' ';
+                }
+                hex[3 * n] = 0;
+            }
+            DbgPrint("goyasdio: f%u CMD%u %s fn%u 0x%05x %s count %u len %u st %08x %s\n", p->Fn, cmd, (a >> 31) ? "W" : "R",
+                     (a >> 28) & 7, (a >> 9) & 0x1FFFF, (a & (1UL << 27)) ? "blk" : "byte", a & 0x1FF,
+                     len, s, hex);
+        }
+    } else {
+        ULONG v = 0, n = r->Parameters.GetSetProperty.Length;
+        if (r->Parameters.GetSetProperty.Buffer && n) RtlCopyMemory(&v, r->Parameters.GetSetProperty.Buffer, n < 4 ? n : 4);
+        DbgPrint("goyasdio: f%u %s property %u len %u value %x st %08x\n", p->Fn,
+                 r->RequestFunction == SDRF_GET_PROPERTY ? "get" : r->RequestFunction == SDRF_SET_PROPERTY ? "set" : "???",
+                 r->Parameters.GetSetProperty.Property, n, v, s);
+    }
+}
+
 static NTSTATUS GsStatus(SD_STATUS st)
 {
     switch (st) {
@@ -420,6 +589,155 @@ static NTSTATUS GsSetProperty(PGS_PDO p, ULONG prop, PVOID buf, ULONG len)
     return GsStatus(st);
 }
 
+/* Firmware compatibility shim. The Surface RT driver (FP62 MLAN, written for the 8797) sends host commands
+   the SM-T110's 8777 FP66 firmware does not implement; it answers them with result 2 (not supported) and the
+   driver then fails its initialization (Code 10). For the commands listed here a "not supported" response
+   read from the command port is reported as success instead. SDIO data-port packet: le16 length, le16 type
+   (1 = command response), then the command header: le16 command | 0x8000, le16 size, le16 seq, le16 result. */
+static const USHORT gGsOptionalCmds[] = { 0x00d4 };
+static volatile LONG gGsShimLog;
+
+static VOID GsCmdRespShim(PGS_PDO p, ULONG arg, PUCHAR va, ULONG len)
+{
+    USHORT type, id, res;
+    ULONG i;
+    if ((arg >> 31) || ((arg >> 28) & 7) != 1 || ((arg >> 9) & 0x1FFFF) < 0x10000 || len < 12) return;
+    type = (USHORT)(va[2] | (va[3] << 8));
+    id = (USHORT)(va[4] | (va[5] << 8));
+    res = (USHORT)(va[10] | (va[11] << 8));
+    if (type == 1 && id == 0x8003) {               /* GET_HW_SPEC response: the firmware's capabilities, in full */
+        ULONG n = (ULONG)(va[0] | (va[1] << 8)), o;
+        if (n > len) n = len;
+        if (n > 128) n = 128;
+        for (o = 0; o < n; o += 16) {
+            char hex[3 * 16 + 1];
+            static const char hd[] = "0123456789abcdef";
+            ULONG k, m = n - o < 16 ? n - o : 16;
+            for (k = 0; k < m; k++) {
+                hex[3 * k] = hd[va[o + k] >> 4];
+                hex[3 * k + 1] = hd[va[o + k] & 15];
+                hex[3 * k + 2] = ' ';
+            }
+            hex[3 * m] = 0;
+            DbgPrint("goyasdio: f%u HW_SPEC +%02x: %s\n", p->Fn, o, hex);
+        }
+    }
+    if (type != 1 || !(id & 0x8000) || res != 2) return;
+    for (i = 0; i < RTL_NUMBER_OF(gGsOptionalCmds); i++) {
+        if ((id & 0x7FFF) == gGsOptionalCmds[i]) {
+            va[10] = 0;
+            va[11] = 0;
+            if (InterlockedIncrement(&gGsShimLog) <= 20)
+                DbgPrint("goyasdio: f%u firmware does not support command %04x: reported as done\n", p->Fn, id & 0x7FFF);
+            return;
+        }
+    }
+}
+
+/* Received data (function 1 data ports 0x10001-0x1FFFF, read). Each packet: le16 length, le16 type (0 = data),
+   then the RxPD: u8 bss_type, u8 bss_num, le16 rx_pkt_length, le16 rx_pkt_offset, le16 rx_pkt_type, ...
+   goyawifi is a Native Wi-Fi driver written for the 8797 Windows firmware, which delivers the whole 802.11 frame
+   at rx_pkt_offset; the driver hands that to Windows as it is (its receive filter reads the frame type from the
+   first byte there). The 8777 FP66 firmware marks received frames rx_pkt_type 2 and delivers an Ethernet frame
+   (DA, SA, type) at rx_pkt_offset, with the frame's 802.11 header copied in at RxPD+0x22. Windows then gets a
+   frame it cannot parse (the destination address read as the frame control) and never answers WPA2 message 1.
+   The frame is rebuilt in place as the 8797 firmware delivers it: 802.11 header, LLC/SNAP AA AA 03 00 00 00 +
+   type, payload, ending where the Ethernet frame ended; rx_pkt_offset/length are updated and the type becomes 0.
+   The firmware has already decrypted the payload but its header copy keeps the Protected bit; that is cleared, or
+   Windows takes the start of the payload for a CCMP header and drops every encrypted frame (no DHCP lease).
+   goyawifi takes RxPD byte 17 for "arrived unencrypted" (its Exclude Unencrypted filter drops such data frames);
+   the 8777 has other data there (nonzero), so it is set from the Protected bit: 0 encrypted, 1 not. Byte 16
+   (8797 flags, bits 2 and 3 read by MLAN) holds unrelated 8777 data too and is cleared.
+   Aggregated reads hold several packets, each padded to the 256-byte block. */
+#define GS_RXPD_HDR 0x22                       /* 802.11 header copy in the 8777 RxPD */
+static volatile LONG gGsRxShimLog;
+
+static VOID GsRxDataShim(PGS_PDO p, ULONG arg, PUCHAR va, ULONG len)
+{
+    ULONG off = 0, plen, r, po, pl, hl, e, npo, npl;
+    PUCHAR h;
+    if ((arg >> 31) || ((arg >> 28) & 7) != 1 || ((arg >> 9) & 0x1FFFF) <= 0x10000) return;
+    while (off + 12 <= len) {
+        plen = (ULONG)(va[off] | (va[off + 1] << 8));
+        if (plen < 12 || plen > len - off) break;
+        r = off + 4;                                   /* RxPD */
+        if (va[off + 2] == 0 && va[off + 3] == 0 && va[r + 6] == 2 && va[r + 7] == 0 && plen >= 4 + GS_RXPD_HDR + 24) {
+            pl = (ULONG)(va[r + 2] | (va[r + 3] << 8));
+            po = (ULONG)(va[r + 4] | (va[r + 5] << 8));
+            h = va + r + GS_RXPD_HDR;
+            hl = 24 + ((h[1] & 3) == 3 ? 6 : 0) + ((h[0] & 0x80) ? 2 : 0) + (((h[0] & 0x80) && (h[1] & 0x80)) ? 4 : 0);
+            e = r + po;
+            if ((h[0] & 0x0C) == 0x08 && pl >= 14 && GS_RXPD_HDR + hl <= po && e + pl <= off + plen) {
+                if (((va[e + 12] << 8) | va[e + 13]) >= 0x600) {      /* Ethernet II: SNAP header before the type */
+                    va[e + 6] = 0xAA; va[e + 7] = 0xAA; va[e + 8] = 0x03; va[e + 9] = 0; va[e + 10] = 0; va[e + 11] = 0;
+                    npo = po + 6 - hl; npl = pl - 6 + hl;
+                } else {                                               /* 802.3: LLC follows the length */
+                    npo = po + 14 - hl; npl = pl - 14 + hl;
+                }
+                va[r + 16] = 0;                        /* 8797 RxPD flags (bits 2, 3 read by MLAN): none */
+                va[r + 17] = (h[1] & 0x40) ? 0 : 1;   /* 8797 RxPD byte 17: frame arrived unencrypted */
+                RtlMoveMemory(va + r + npo, h, hl);
+                va[r + npo + 1] &= ~0x40;              /* decrypted by the firmware: no Protected bit */
+                va[r + 2] = (UCHAR)npl; va[r + 3] = (UCHAR)(npl >> 8);
+                va[r + 4] = (UCHAR)npo; va[r + 5] = (UCHAR)(npo >> 8);
+                va[r + 6] = 0;
+                if (InterlockedIncrement(&gGsRxShimLog) <= 20)
+                    DbgPrint("goyasdio: f%u rx 802.11 frame rebuilt: fc %02x%02x header %u, offset %u -> %u, length %u -> %u\n",
+                             p->Fn, va[r + npo], va[r + npo + 1], hl, po, npo, pl, npl);
+            } else if (InterlockedIncrement(&gGsRxShimLog) <= 20) {
+                DbgPrint("goyasdio: f%u rx type 2 packet left alone: fc %02x%02x offset %u length %u\n", p->Fn, h[0], h[1], po, pl);
+            }
+        }
+        off += (plen + 255) & ~255UL;
+    }
+}
+
+/* Data to send (function 1 data ports, write): le16 length, le16 type 0, then the TxPD: u8 bss_type, u8 bss_num,
+   le16 tx_pkt_length, le16 tx_pkt_offset, le16 tx_pkt_type, le32 tx_control, u8 priority, u8 flags, u8 delay,
+   u8 [15]. In Native Wi-Fi mode goyawifi sends the 802.11 frame from Windows and sets TxPD byte 15 to 1 for the
+   8797 Windows firmware; the 8777 FP66 firmware sends Ethernet frames. Each 802.11 data frame with an LLC/SNAP
+   header becomes DA, SA, type + payload in place (ending where it ended), byte 15 becomes 0. */
+static volatile LONG gGsTxShimLog;
+
+static VOID GsTxDataShim(PGS_PDO p, ULONG arg, PUCHAR va, ULONG len)
+{
+    ULONG off = 0, plen, t, po, pl, hl, f, e, i;
+    UCHAR da[6], sa[6];
+    if (!(arg >> 31) || ((arg >> 28) & 7) != 1 || ((arg >> 9) & 0x1FFFF) <= 0x10000) return;
+    while (off + 20 <= len) {
+        plen = (ULONG)(va[off] | (va[off + 1] << 8));
+        if (plen < 20 || plen > len - off) break;
+        t = off + 4;                                   /* TxPD */
+        pl = (ULONG)(va[t + 2] | (va[t + 3] << 8));
+        po = (ULONG)(va[t + 4] | (va[t + 5] << 8));
+        f = t + po;
+        if (va[off + 2] == 0 && va[off + 3] == 0 && va[t + 15] == 1 && po >= 16 && pl >= 24 + 8 && f + pl <= off + plen) {
+            hl = 24 + ((va[f + 1] & 3) == 3 ? 6 : 0) + ((va[f] & 0x80) ? 2 : 0) + (((va[f] & 0x80) && (va[f + 1] & 0x80)) ? 4 : 0);
+            if ((va[f] & 0x0C) == 0x08 && (va[f + 1] & 3) != 3 && pl >= hl + 8 &&
+                va[f + hl] == 0xAA && va[f + hl + 1] == 0xAA && va[f + hl + 2] == 0x03 &&
+                va[f + hl + 3] == 0 && va[f + hl + 4] == 0 && va[f + hl + 5] == 0) {
+                for (i = 0; i < 6; i++) {
+                    da[i] = va[f + ((va[f + 1] & 1) ? 16 : 4) + i];             /* ToDS: DA is address 3 */
+                    sa[i] = va[f + ((va[f + 1] & 2) ? 16 : 10) + i];
+                }
+                e = f + hl - 6;                                              /* the type stays where it is */
+                RtlCopyMemory(va + e, da, 6);
+                RtlCopyMemory(va + e + 6, sa, 6);
+                po += hl - 6; pl -= hl - 6;
+                va[t + 2] = (UCHAR)pl; va[t + 3] = (UCHAR)(pl >> 8);
+                va[t + 4] = (UCHAR)po; va[t + 5] = (UCHAR)(po >> 8);
+                va[t + 15] = 0;
+                if (InterlockedIncrement(&gGsTxShimLog) <= 20)
+                    DbgPrint("goyasdio: f%u tx 802.11 frame -> Ethernet: type %02x%02x, offset %u, length %u\n",
+                             p->Fn, va[e + 12], va[e + 13], po, pl);
+            } else if (InterlockedIncrement(&gGsTxShimLog) <= 20) {
+                DbgPrint("goyasdio: f%u tx 802.11 frame left alone: fc %02x%02x length %u\n", p->Fn, va[f], va[f + 1], pl);
+            }
+        }
+        off += (plen + 255) & ~255UL;
+    }
+}
+
 static NTSTATUS GsDeviceCommand(PGS_PDO p, PGS_REQUEST_PACKET r)
 {
     PGS_FDO f = p->Fdo;
@@ -437,8 +755,13 @@ static NTSTATUS GsDeviceCommand(PGS_PDO p, PGS_REQUEST_PACKET r)
         va = (PUCHAR)MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
         if (!va) return STATUS_INSUFFICIENT_RESOURCES;
         fn = (arg >> 28) & 7;
+        GsTxDataShim(p, arg, va, len);
         st = SdioCmd53(&f->Sd, arg, va, len, f->Sd.FnBlk[fn], &r5);
-        if (st == SD_OK) r->Information = len;
+        if (st == SD_OK) {
+            r->Information = len;
+            GsCmdRespShim(p, arg, va, len);
+            GsRxDataShim(p, arg, va, len);
+        }
     } else {
         DbgPrint("goyasdio: CMD%u from function %u not supported\n", cmd, p->Fn);
         return STATUS_NOT_SUPPORTED;
@@ -472,6 +795,7 @@ static NTSTATUS GsProcess(PGS_PDO p, PGS_REQUEST_PACKET r)
     }
     ExReleaseFastMutex(&f->BusLock);
     f->Requests++;
+    GsTraceReq(p, r, s);
     if (!NT_SUCCESS(s)) {
         f->ReqErrors++;
         if (f->ReqErrors <= 20)
@@ -512,6 +836,7 @@ static NTSTATUS GsIfInitialize(PVOID ctx, PGS_INTERFACE_PARAMETERS ip)
     p->CallbackCtx = ip->CallbackRoutineContext;
     p->CallbackAtDpc = ip->CallbackAtDpcLevel;
     p->Callback = ip->DeviceGeneratesInterrupts ? ip->CallbackRoutine : NULL;
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) GsWifiLogAttach((PVOID)ip->CallbackRoutine);
     p->IntPending = FALSE;
     p->Forward = TRUE;
     if (ip->DeviceGeneratesInterrupts && KeGetCurrentIrql() == PASSIVE_LEVEL && f && f->CardOk) {
@@ -529,6 +854,7 @@ static NTSTATUS GsIfAck(PVOID ctx)
 {
     PGS_PDO p = GsPdoFromCtx(ctx);
     if (!p) return STATUS_INVALID_PARAMETER;
+    if (InterlockedIncrement(&gTraceInts) <= 60) DbgPrint("goyasdio: f%u acknowledge interrupt\n", p->Fn);
     p->IntPending = FALSE;                         /* the poll thread re-enables the status on its next tick */
     return STATUS_SUCCESS;
 }
@@ -581,6 +907,8 @@ static VOID GsPollThread(PVOID ctx)
         ExReleaseFastMutex(&f->BusLock);
         if (fire) {
             GS_SDBUS_CALLBACK cb = fire->Callback;
+            if (InterlockedIncrement(&gTraceInts) <= 60)
+                DbgPrint("goyasdio: f%u card interrupt -> callback (%s)\n", fire->Fn, fire->CallbackAtDpc ? "dispatch" : "passive");
             if (cb) {
                 if (fire->CallbackAtDpc) {
                     KIRQL old;
@@ -759,6 +1087,11 @@ static NTSTATUS GsPdoPnp(PGS_PDO p, PIRP irp)
             GsIfRef(&p->IfCtx);
             DbgPrint("goyasdio: SD bus interface (version %x) handed to function %u\n", i->Version, p->Fn);
             s = STATUS_SUCCESS;
+        } else if (InterlockedIncrement(&gTraceOther) <= 40) {
+            const GUID *g = sp->Parameters.QueryInterface.InterfaceType;
+            DbgPrint("goyasdio: f%u query interface {%08x-%04x-%04x-%02x%02x-...} size %u version %u: not ours\n", p->Fn,
+                     g->Data1, g->Data2, g->Data3, g->Data4[0], g->Data4[1], sp->Parameters.QueryInterface.Size,
+                     sp->Parameters.QueryInterface.Version);
         }
         break;
     case IRP_MN_QUERY_BUS_INFORMATION: {
@@ -774,9 +1107,19 @@ static NTSTATUS GsPdoPnp(PGS_PDO p, PIRP irp)
     case IRP_MN_QUERY_PNP_DEVICE_STATE:
         s = STATUS_SUCCESS;
         break;
-    default:
-        break;                                     /* resources, usage notifications ...: status unchanged */
+    default:                                       /* resources, usage notifications ...: status unchanged */
+        if (InterlockedIncrement(&gTraceOther) <= 40)
+            DbgPrint("goyasdio: f%u PnP minor %02x not handled (status %08x)\n", p->Fn, sp->MinorFunction, s);
+        break;
     }
+    if (sp->MinorFunction == IRP_MN_REMOVE_DEVICE || sp->MinorFunction == IRP_MN_SURPRISE_REMOVAL) {
+        GsWifiLogDump();                           /* the function driver may be unloaded after this */
+        gWifiLog = NULL;
+    }
+    if (sp->MinorFunction == IRP_MN_START_DEVICE || sp->MinorFunction == IRP_MN_STOP_DEVICE ||
+        sp->MinorFunction == IRP_MN_REMOVE_DEVICE || sp->MinorFunction == IRP_MN_SURPRISE_REMOVAL)
+        DbgPrint("goyasdio: f%u PnP minor %02x -> %08x (%d download-loop requests not shown, %u CMD53, %u bus errors)\n",
+                 p->Fn, sp->MinorFunction, s, InterlockedExchange(&gTraceSkipped, 0), f ? f->Sd.Cmd53s : 0, f ? f->Sd.Errors : 0);
     irp->IoStatus.Status = s;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return s;
@@ -830,6 +1173,10 @@ static NTSTATUS GsPdoInternalIoctl(PGS_PDO p, PIRP irp)
 
     if (sp->Parameters.DeviceIoControl.IoControlCode != GS_IOCTL_SD_SUBMIT_REQUEST || !r ||
         sp->Parameters.DeviceIoControl.InputBufferLength < sizeof(GS_REQUEST_PACKET)) {
+        if (InterlockedIncrement(&gTraceOther) <= 40)
+            DbgPrint("goyasdio: f%u rejected internal IOCTL %08x input %p len %u (want %08x, len >= %u)\n", p->Fn,
+                     sp->Parameters.DeviceIoControl.IoControlCode, r, sp->Parameters.DeviceIoControl.InputBufferLength,
+                     GS_IOCTL_SD_SUBMIT_REQUEST, (ULONG)sizeof(GS_REQUEST_PACKET));
         s = STATUS_INVALID_DEVICE_REQUEST;
     } else if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
         /* asynchronous submit from DISPATCH_LEVEL: do it in a work item */
@@ -1052,6 +1399,8 @@ static NTSTATUS GsDispatchOther(PDEVICE_OBJECT d, PIRP irp)
     if (c->IsFdo && sp->MajorFunction == IRP_MJ_SYSTEM_CONTROL) return GsPassDown((PGS_FDO)c, irp);
     s = (sp->MajorFunction == IRP_MJ_CREATE || sp->MajorFunction == IRP_MJ_CLOSE || sp->MajorFunction == IRP_MJ_CLEANUP)
         ? STATUS_SUCCESS : (sp->MajorFunction == IRP_MJ_SYSTEM_CONTROL ? irp->IoStatus.Status : STATUS_INVALID_DEVICE_REQUEST);
+    if (s == STATUS_INVALID_DEVICE_REQUEST && InterlockedIncrement(&gTraceOther) <= 40)
+        DbgPrint("goyasdio: %s got IRP major %02x minor %02x: rejected\n", c->IsFdo ? "bus" : "function", sp->MajorFunction, sp->MinorFunction);
     irp->IoStatus.Status = s;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return s;

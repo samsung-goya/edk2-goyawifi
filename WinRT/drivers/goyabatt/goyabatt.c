@@ -80,6 +80,12 @@ typedef struct _GOYA_BATT {
                                    calls GbQuery* from inside BatteryClassIoctl), never the other way */
     PVOID        ClassHandle;
     ULONG        Notifies;
+    /* touch panel supply (PMIC LDO1), see GbTouchPower */
+    PKEVENT      TouchEv;
+    HANDLE       TouchEvH;
+    ULONG        LdoOffSeen, LdoCycles, LdoErrors;
+    BOOLEAN      LdoKnown;
+    UCHAR        LdoEna, LdoVout;
 } GOYA_BATT, *PGOYA_BATT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(GOYA_BATT, GetBatt)
 
@@ -203,6 +209,75 @@ static NTSTATUS GbSetInformation(PVOID Context, ULONG BatteryTag, BATTERY_SET_IN
     return STATUS_NOT_SUPPORTED;
 }
 
+/* ================= touch panel supply ================= */
+
+/* The Zinitix touch chip runs from the PMIC's LDO1 (2.8 V), which only this driver can reach (TWSI2).
+   Touch has been seen to stop answering on its bus after a while; the vendor driver's cure for a dead
+   chip is to switch LDO1 off and on. So on every poll: check that LDO1 is still on (and log it if it was
+   found off: something else switched it), and when goyatouch asks for it through the named event
+   \BaseNamedObjects\GoyaTouchPowerCycle, power-cycle it and clear the event (goyatouch sees the clear as
+   the answer). */
+#define PM_POWER_PAGE   0x31
+#define PM_LDO1_VOUT    0x08            /* bits 3:0, 4 = 2.8 V */
+#define PM_LDO_ENA1_1   0x51            /* bit 0 = LDO1 */
+#define LDO1_2V8        4
+
+static VOID GbTouchEventOpen(PGOYA_BATT B);
+
+static VOID GbTouchPower(PGOYA_BATT B)
+{
+    BC_HOST *c = &B->Hw;
+    UCHAR ena = 0, vout = 0;
+    int rc;
+
+    rc = BcPmRead(c, PM_POWER_PAGE, PM_LDO_ENA1_1, &ena, 1);
+    if (rc == 0) rc = BcPmRead(c, PM_POWER_PAGE, PM_LDO1_VOUT, &vout, 1);
+    if (rc != 0) {
+        if (B->LdoErrors++ < 5) DbgPrint("goyabatt: touch LDO1 read failed (%d)\n", rc);
+        return;
+    }
+    if (!B->LdoKnown || ena != B->LdoEna || vout != B->LdoVout) {
+        DbgPrint("goyabatt: touch LDO1 %s, VOUT 0x%02x (LDO_ENA1_1 0x%02x)%s\n", (ena & 1) ? "on" : "OFF", vout, ena,
+                 B->LdoKnown ? " - changed" : "");
+        B->LdoKnown = TRUE;
+        B->LdoEna = ena;
+        B->LdoVout = vout;
+    }
+    if (!(ena & 1)) {
+        B->LdoOffSeen++;
+        DbgPrint("goyabatt: touch LDO1 found off (%u times), switching it back on\n", B->LdoOffSeen);
+        if ((vout & 0x0F) != LDO1_2V8) BcPmWrite(c, PM_POWER_PAGE, PM_LDO1_VOUT, (UCHAR)((vout & 0xF0) | LDO1_2V8));
+        BcPmWrite(c, PM_POWER_PAGE, PM_LDO_ENA1_1, (UCHAR)(ena | 1));
+        B->LdoKnown = FALSE;
+    }
+    if (B->TouchEv == NULL) GbTouchEventOpen(B);
+    if (B->TouchEv != NULL && KeReadStateEvent(B->TouchEv)) {
+        B->LdoCycles++;
+        rc = BcPmWrite(c, PM_POWER_PAGE, PM_LDO_ENA1_1, (UCHAR)(ena & ~1));
+        GbSleepMs(100);
+        if ((vout & 0x0F) != LDO1_2V8) BcPmWrite(c, PM_POWER_PAGE, PM_LDO1_VOUT, (UCHAR)((vout & 0xF0) | LDO1_2V8));
+        if (rc == 0) rc = BcPmWrite(c, PM_POWER_PAGE, PM_LDO_ENA1_1, (UCHAR)(ena | 1));
+        GbSleepMs(50);
+        DbgPrint("goyabatt: touch LDO1 power-cycled for goyatouch (%u times, %d)\n", B->LdoCycles, rc);
+        KeClearEvent(B->TouchEv);
+        B->LdoKnown = FALSE;
+    }
+}
+
+/* \BaseNamedObjects only exists once the session manager has run: a boot-start driver has to retry */
+static VOID GbTouchEventOpen(PGOYA_BATT B)
+{
+    UNICODE_STRING n;
+    static ULONG tries;
+    RtlInitUnicodeString(&n, L"\\BaseNamedObjects\\GoyaTouchPowerCycle");
+    tries++;
+    B->TouchEv = IoCreateNotificationEvent(&n, &B->TouchEvH);
+    if (B->TouchEv != NULL) {
+        KeClearEvent(B->TouchEv);
+        DbgPrint("goyabatt: GoyaTouchPowerCycle event open (try %u)\n", tries);
+    }
+}
+
 /* ================= polling ================= */
 
 static VOID OnTimer_(WDFTIMER Timer)
@@ -213,6 +288,7 @@ static VOID OnTimer_(WDFTIMER Timer)
 
     if (!B->Running || !B->HwOk) return;
     changed = BcPoll(c);
+    GbTouchPower(B);
 
     WdfWaitLockAcquire(B->Lock, NULL);
     B->Pub.Ready = c->Seeded;
@@ -305,6 +381,7 @@ static NTSTATUS OnD0Entry_(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Prev)
         if (rc != 0) DbgPrint("goyabatt: PMIC not answering (%d), charger only\n", rc);
         B->HwOk = TRUE;
     }
+    if (B->TouchEv == NULL) GbTouchEventOpen(B);
     B->Running = TRUE;
     WdfTimerStart(B->Timer, WDF_REL_TIMEOUT_IN_MS(10));
     return STATUS_SUCCESS;

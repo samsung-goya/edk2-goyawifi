@@ -29,6 +29,8 @@
 
 [Protocols]
   gEfiAcpiTableProtocolGuid                     ## CONSUMES
+  gPxa988Cpu1ParkingProtocolGuid                ## CONSUMES
 
 [Depex]
-  gEfiAcpiTableProtocolGuid
+  # Pxa988SmpDxe always installs the parking protocol (addresses 0 when CPU1 is not parked)
+  gEfiAcpiTableProtocolGuid AND gPxa988Cpu1ParkingProtocolGuid

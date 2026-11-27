@@ -8,16 +8,32 @@ make-goyawifi-pkg.py - build the goyawifi driver package (Marvell 88W8777 Wi-Fi 
 
     python3 make-goyawifi-pkg.py <dir with mwls97w8arm.sys/.inf> <file sd8777_uapsta.bin> <outdir>
 
-Output: goyawifi.inf, goyawifi.sys (the Marvell binary, unchanged), mv14sxx97.bin (the 8777 firmware).
+Output: goyawifi.inf, goyawifi.sys (the Marvell binary, one table patched, below), mv14sxx97.bin (the
+8777 firmware).
 The driver loads its firmware with NdisOpenFile("mv14sxx97.bin") from System32\\drivers and only falls
 back to the 8797 image built into it when that file is missing (moal_main.cpp, sys+0x19808), so the
 firmware is replaced by installing the file, without patching the binary.
+
+Binary patch (SYS_PATCHES): the driver's operating-mode table (.data, file 0x11a9a8: le16 mode, le16
+interface count, pointer to a list of 20-byte BSS attributes {type, frame type, active, priority, number})
+gives modes 3 and 4 five interfaces: station, uAP and Wi-Fi Direct 0, 1, 2. The 8777 FP66 firmware never
+answers the first command for Wi-Fi Direct 2 (TX_RATE_CFG, seq 0x221f); the driver times out after 10 s,
+dumps registers through an SDIO handle that is already gone and bugchecks (0x7E in goyawifi.sys+0x45302).
+Both counts become 3: station, uAP and one Wi-Fi Direct interface, as the Android driver for this firmware
+sets up; with these every command succeeds. (The mode itself, hard-coded 4 at RVA 0x1a47a, must stay:
+station-only mode 1 bugchecks later, 0x7E at goyawifi.sys+0x31CAE, where the driver reads interface 2's
+bss index without a check.) The signing step re-signs the binary.
 
 INF changes (everything else is Marvell's INF as shipped):
   - hardware IDs SD\\VID_02DF&PID_9131(&FN_1) (88W8777 WLAN function, from goyasdio) instead of PID_9129
   - binary goyawifi.sys, catalog goyawifi.cat, firmware file copied to System32\\drivers
   - no netvwifibus.inf Include/Needs (virtual Wi-Fi bus; not needed for a station, and not checked on 8520)
   - Band 3 (802.11bgn: the 8777 has no 5 GHz radio), HTTxRxStream 0 (1x1)
+  - 5GhzAutoUse40MHz 0: with Marvell's 1 (and 2.4 GHz 0) the driver sets the 802.11n user config for the
+    A band only, which the 8777 does not have
+  - Dot11nAggMode 0 (no A-MPDU): the driver's 802.11n user config (htusrcap 0x14000000 with A-MPDU) is
+    rejected by MLAN against the 8777 firmware's 802.11n capabilities; moal_set_reg_params then fails,
+    the driver shuts the firmware down and the adapter does not start (Code 10)
 The inputs are checked against the SHA-256 values below.
 """
 import hashlib, os, re, shutil, sys
@@ -25,6 +41,12 @@ import hashlib, os, re, shutil, sys
 SYS_SHA = 'ac47a0927099cffac55d51dbc91da32f848481f04987a8de5027548245a87fde'   # mwls97w8arm.sys 14.62.17215.91
 INF_SHA = '0ee61f5d63f424a6f0478a9c6410275bcb98269dc266d1d27d9feab2d0329d72'   # mwls97w8arm.inf (UTF-16)
 FW_SHA  = 'd34311ee2ac590d8cddde37a2f903865ee50fa4069390f858d322eac2c81f518'   # sd8777_uapsta.bin 14.66.33.p46
+
+# (file offset, original bytes, new bytes): interface counts of operating modes 3 and 4, 5 -> 3
+SYS_PATCHES = [
+    (0x11a9b8, bytes.fromhex('03000500'), bytes.fromhex('03000300')),
+    (0x11a9c0, bytes.fromhex('04000500'), bytes.fromhex('04000300')),
+]
 
 
 def sha(path):
@@ -84,6 +106,10 @@ def main():
             l, changes = ' mv14sxx97.bin', changes + 1
         elif re.match(r'(?i)^HKR,,Band\s*,', s):
             l, changes = 'HKR,,Band  ,0x00010001      ,3      ; goyawifi: 802.11bgn (8777: 2.4 GHz only)', changes + 1
+        elif re.match(r'(?i)^HKR,,5GhzAutoUse40MHz\s*,', s):
+            l, changes = '  HKR,,5GhzAutoUse40MHz  ,0x00010001      ,0      ; goyawifi: no 5 GHz radio', changes + 1
+        elif re.match(r'(?i)^HKR,,Dot11nAggMode\s*,', s):
+            l, changes = 'HKR,,Dot11nAggMode  ,0x00010001      ,0      ; goyawifi: no A-MPDU (rejected on the 8777)', changes + 1
         elif re.match(r'(?i)^HKR,,HTTxRxStream\s*,', s):
             l, changes = 'HKR,,HTTxRxStream,  0x00010001, 0     ; goyawifi: 1x1', changes + 1
         elif re.match(r'(?i)^\s*MRVL_SD8797_DESC_STR\s*=', l):
@@ -91,7 +117,8 @@ def main():
         out_lines.append(l)
 
     body = '\r\n'.join(out_lines)
-    for must in ('goyawifi.cat', 'PID_9131&FN_1', '%12%\\goyawifi.sys', 'mv14sxx97.bin', 'HKR,,Band  ,0x00010001      ,3'):
+    for must in ('goyawifi.cat', 'PID_9131&FN_1', '%12%\\goyawifi.sys', 'mv14sxx97.bin', 'HKR,,Band  ,0x00010001      ,3',
+                 'HKR,,5GhzAutoUse40MHz  ,0x00010001      ,0', 'HKR,,Dot11nAggMode  ,0x00010001      ,0'):
         if must not in body:
             sys.exit(f'INF transform incomplete: "{must}" missing')
     if 'PID_9129' in body or 'netvwifibus' in body.lower() or 'mwls97w8arm.sys' in body:
@@ -99,9 +126,15 @@ def main():
 
     os.makedirs(out, exist_ok=True)
     open(os.path.join(out, 'goyawifi.inf'), 'wb').write(body.encode('ascii') + b'\r\n')
-    shutil.copyfile(sysf, os.path.join(out, 'goyawifi.sys'))
+    sysdata = bytearray(open(sysf, 'rb').read())
+    for off, old, new in SYS_PATCHES:
+        if bytes(sysdata[off:off + len(old)]) != old:
+            sys.exit(f'driver patch at {off:#x}: expected {old.hex()}, found {sysdata[off:off + len(old)].hex()}')
+        sysdata[off:off + len(new)] = new
+    open(os.path.join(out, 'goyawifi.sys'), 'wb').write(sysdata)
     open(os.path.join(out, 'mv14sxx97.bin'), 'wb').write(fwdata)
-    print(f'goyawifi package in {out}: {changes} INF lines changed, firmware {len(fwdata)} bytes')
+    print(f'goyawifi package in {out}: {changes} INF lines changed, {len(SYS_PATCHES)} driver patches, '
+          f'firmware {len(fwdata)} bytes')
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 ## @file
 #  Brings up the second Cortex-A9 core of the PXA988/PXA986 as a self-test and
-#  parks it in reset again before the OS starts.
+#  leaves it waiting for the OS in an ACPI parking-protocol page.
 #
 #  SPDX-License-Identifier: BSD-2-Clause-Patent
 ##
@@ -38,8 +38,12 @@
   gEfiEventExitBootServicesGuid
   gEfiEndOfDxeEventGroupGuid
 
+[Protocols]
+  gPxa988Cpu1ParkingProtocolGuid                ## PRODUCES
+
 [FixedPcd]
   gPxa988TokenSpaceGuid.PcdSecondaryCpuBringup
+  gPxa988TokenSpaceGuid.PcdCpu1ParkingProtocol
 
 [Depex]
   TRUE

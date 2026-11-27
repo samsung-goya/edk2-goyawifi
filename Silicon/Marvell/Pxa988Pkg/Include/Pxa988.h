@@ -18,6 +18,11 @@
 #define PXA988_GICC_BASE            0xD1DFE100
 #define PXA988_GICD_BASE            0xD1DFF000
 
+// ACPI parking-protocol pages of CPU0 and CPU1 (Pxa988SmpDxe), reserved by GoyaWifiPlatformPeiLib.
+// A fixed address in DRAM, which a warm restart keeps, so the next boot can report how the
+// previous OS session used CPU1's page.
+#define PXA988_PARKING_PAGES        0x08180000
+
 #define PL310_CTRL                  0x100
 #define PL310_CACHE_SYNC            0x730
 #define PL310_CLEAN_INV_WAY         0x7FC

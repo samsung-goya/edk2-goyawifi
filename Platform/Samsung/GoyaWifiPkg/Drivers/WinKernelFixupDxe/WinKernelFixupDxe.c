@@ -144,6 +144,25 @@ STATIC CONST KERNEL_SITE  mSites[] = {
     { 0x1a, 0x78, 0x98, 0xf8, 0xe8, 0x32, 0x83, 0xea, 0x42, 0x13, 0x13, 0xf0, 0x20, 0x02 },
     14, 0, { 0x00, 0x22 }, 2                                // movs r2,#0
   },
+  //  KeRestoreProcessorState, which loads a processor's state block (SCTLR, DACR, PRRR/NMRR, VBAR,
+  //  TPIDRs) - the same block the HAL hands a secondary processor in its ACPI parking page - then,
+  //  if the CP14-debug-present flag is set, saves/restores the debug registers (DBGOSLSR, DBGDSCRext,
+  //  breakpoints), UNDEFINED here. On one processor only the resume path calls it; a starting second
+  //  processor would fault there with interrupts off while the first waits for it.
+  //  Both flag tests: ldrb.w r3,[r5,#-0x76] -> movs r3,#0; nop, so the debug part is always skipped.
+  //    ldrb.w r3,[r5,#-0x76]; cmp r3,#0; beq; mrc p15,0,r6,c13,c0,4; bfc r6,#0,#12; mrc p14,0,r3,c1,c1,4
+  {
+    "KeRestoreProcessorState CP14 restore",
+    { 0x15, 0xf8, 0x76, 0x3c, 0x00, 0x2b, 0x73, 0xd0, 0x1d, 0xee, 0x90, 0x6f, 0x6f, 0xf3, 0x0b, 0x06,
+      0x11, 0xee, 0x91, 0x3e },
+    20, 0, { 0x00, 0x23, 0x00, 0xbf }, 4                    // movs r3,#0; nop
+  },
+  //    ldrb.w r3,[r5,#-0x76]; cbz r3; mrc p14,0,r3,c0,c2,2; cmp r2,#0; bne.w ...
+  {
+    "KeRestoreProcessorState CP14 DSCR check",
+    { 0x15, 0xf8, 0x76, 0x3c, 0x3b, 0xb1, 0x10, 0xee, 0x52, 0x3e, 0x00, 0x2a, 0x6f, 0xf0, 0x33, 0x8b },
+    16, 0, { 0x00, 0x23, 0x00, 0xbf }, 4                    // movs r3,#0; nop
+  },
 };
 
 #define SITE_COUNT  (sizeof (mSites) / sizeof (mSites[0]))
